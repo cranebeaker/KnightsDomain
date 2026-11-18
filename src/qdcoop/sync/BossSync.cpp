@@ -167,6 +167,15 @@ constexpr Fn kFns[] = {
     // the Queen's second phase (her model swap is a notify of her own transition montage) and the throne she breaks
     {"/Game/Enemies/Queen/Queen_BP.Queen_BP_C:DoStateTransition", Tgt::Enemy, Org::Owner, kSuppress},
     {"/Game/OtherWorld/Castle_Ext/Castle_Int/Queen_Throne_BP.Queen_Throne_BP_C:Break", Tgt::Actor, Org::Any, kDedupe},
+
+    // Lane B5: arena locks and boss doors placed in the level. Door_Base doors are above (B1); the castle bridge's
+    // doors have their own blockers.
+    {"/Game/OtherWorld/CastleBridge/OW_BridgeDoor.OW_BridgeDoor_C:EnableBlocker", Tgt::Actor, Org::Any, kDedupe},
+    {"/Game/OtherWorld/CastleBridge/OW_BridgeDoor.OW_BridgeDoor_C:DisableBlocker", Tgt::Actor, Org::Any, kDedupe},
+    // the Bridge Lord's doors also close when its capsule enters their trigger: a follower's copy wandering through it
+    // closed that player's doors on its own; the host's (its owner's) arrives instead
+    {"/Game/Enemies/JosamiLord/JosamiLord_Spawner.JosamiLord_Spawner_C:CloseDoorsTriggerOverlapped", Tgt::Actor,
+     Org::Host, 0},
 };
 constexpr int kFnCount = static_cast<int>(sizeof(kFns) / sizeof(kFns[0]));
 
