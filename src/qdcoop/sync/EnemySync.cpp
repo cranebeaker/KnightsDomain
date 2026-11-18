@@ -390,6 +390,7 @@ struct State {
     std::unordered_map<uint64_t, OwnerRec>       owners;   // session-scoped; survives world changes
     std::unordered_map<const void*, uint64_t>    byEnemy;
     std::unordered_map<const void*, uint64_t>    spawnerIds;
+    std::unordered_map<const void*, uint64_t>    aliases;   // copied boss adds -> the owner's id (EnemySyncAlias)
     std::unordered_map<uint64_t, const void*>    idOwner;   // id -> spawner (duplicate GUID detection)
     std::unordered_map<const void*, double>      spawnerAllowUntil;
     std::unordered_map<SDK::UEnemyData_C*, DataInfo> datas;   // NOT cleared on world change (assets outlive worlds)
@@ -1187,7 +1188,11 @@ void Rebuild(double now) {
                 }
             }
         }
-        if (!id) id = ue::Fnv1a64(ue::PathName(en));   // placed enemies: path names match across machines
+        if (!id) {
+            // placed enemies: path names match across machines; a boss's add copied from its owner: the owner's id
+            auto al = s.aliases.find(en);
+            id = al != s.aliases.end() ? al->second : ue::Fnv1a64(ue::PathName(en));
+        }
         Entry& e = s.entries[id];
         e.id = id;
         if (AttachEnemy(e, en)) newActors.push_back(id);
@@ -1975,7 +1980,11 @@ bool OnCustomAttackPre(hooks::CallInfo& ci, int index) {
     Entry& e = ei->second;
     e.customAttacks = true;
     if (!IsMine(bi->second) || !e.relevant) return false;
-    SendEvent(e.id, net::EnemyEventType::CustomAttack, PackAttack(index, e));
+    // its Blueprint picks a swing at random (the Grave Guardian's DoNormalAttack picks one of three montages): seed
+    // the game's rand() here and on every follower, so the replayed swing is the owner's
+    const uint32_t seed = NextSeed();
+    ue::SeedGameRand(seed);
+    SendEvent(e.id, net::EnemyEventType::CustomAttack, PackAttack(index, e), seed);
     return false;
 }
 
@@ -1988,6 +1997,9 @@ void OnEnemyInteractPost(hooks::CallInfo& ci) {
     auto ei = s.entries.find(bi->second);
     if (ei == s.entries.end()) return;
     Entry& e = ei->second;
+    // the Interact of a defeated boss is the talk that hands out its reward (Grave Guardian, Necronomicon, Whaleking,
+    // Bridge Lord ...): every player does that on their own copy, it does not start anything
+    if (auto* en = static_cast<SDK::AEnemyBase_C*>(ci.object); en->bDead) return;
     const double now = Now();
     if (now - e.interactSentAt < kInteractNoticeSec) return;
     e.interactSentAt = now;
@@ -2886,6 +2898,7 @@ void ApplyEvent(const net::MsgEnemyEvent& ev) {
                 TakeControl(e, en);
                 e.customAttacks = true;
                 alignas(16) uint8_t parms[64] = {};   // DoNormalAttack / DoBigAttack take no parameters
+                if (ev.seed) ue::SeedGameRand(ev.seed);
                 s.replayingCustom = true;
                 Call(en, kCustomAttacks[ca].name, parms);
                 s.replayingCustom = false;
@@ -3436,6 +3449,15 @@ SDK::AActor* EnemyActorOfId(uint64_t id) {
     return it->second.enemy;
 }
 bool EnemyOwnedHere(uint64_t id) { return IsMine(id); }
+uint64_t EnemyIdForNewActor(const SDK::AActor* actor) { return actor ? ue::Fnv1a64(ue::PathName(actor)) : 0; }
+void EnemySyncAlias(const SDK::AActor* actor, uint64_t id) {
+    auto& s = S();
+    if (!actor || !id) return;
+    if (s.aliases.size() > 512)
+        for (auto it = s.aliases.begin(); it != s.aliases.end();)
+            it = Valid(static_cast<const SDK::UObject*>(it->first)) ? std::next(it) : s.aliases.erase(it);
+    s.aliases[actor] = id;
+}
 bool EnemyIsBossLike(uint64_t id) {
     auto& s = S();
     auto it = s.entries.find(id);
