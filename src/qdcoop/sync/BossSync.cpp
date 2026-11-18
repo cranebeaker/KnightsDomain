@@ -25,6 +25,8 @@
 #include "SDK/QueensDomain_classes.hpp"
 #include "SDK/EnemyBase_classes.hpp"
 #include "SDK/FS_PlayerChar_classes.hpp"
+#include "SDK/Engine_parameters.hpp"
+#include "SDK/WhaleKingPoisonManager_classes.hpp"
 
 #include "qdcoop/sync/BossSync.h"
 
@@ -54,6 +56,7 @@ constexpr uint8_t kSuppress = 2;    // Enemy: a follower's own call is skipped
 constexpr uint8_t kBossOnly = 4;    // Enemy: only for boss-like enemies (boss bar, elite / boss tier)
 constexpr uint8_t kDedupe = 8;      // the same call on the same object within kDedupeSec runs once on each machine
 constexpr uint8_t kNoPlayer = 16;   // player parameters arrive as None (an Interact replayed without its message box)
+constexpr uint8_t kDirect = 32;     // only calls made outside the enemy's per-frame TickHitboxes
 
 struct Fn { const char* path; Tgt tgt; Org org; uint8_t flags; };
 
@@ -91,9 +94,26 @@ constexpr Fn kFns[] = {
     {"/Game/Enemies/Necronomicon/Necronomicon_BP.Necronomicon_BP_C:ExitDemonMode", Tgt::Enemy, Org::Owner, kSuppress},
     // the eye laser damages through a line trace, not a hitbox
     {"/Game/Enemies/Necronomicon/Necronomicon_BP.Necronomicon_BP_C:DoEyeLaser", Tgt::Enemy, Org::Owner, kSuppress},
+
+    // Lane B2: Aqua Ruins and Stone Garden.
+    // one-shot hitbox checks a boss runs itself (the Whaleking's stomps and tail slams), outside its hitbox tick
+    {"/Game/Enemies/EnemyBase.EnemyBase_C:TickIndividualHitbox", Tgt::Enemy, Org::Owner, kBossOnly | kDirect},
+    // Whaleking (and the King of Stone, its child class): the arena water, the poison pools and the horn
+    {"/Game/Enemies/WhaleKing/Whaleking_Boss_BP.Whaleking_Boss_BP_C:DrainWater", Tgt::Enemy, Org::Owner, kSuppress},
+    {"/Game/Enemies/WhaleKing/Whaleking_Boss_BP.Whaleking_Boss_BP_C:RefillWater", Tgt::Enemy, Org::Owner, kSuppress},
+    {"/Game/Enemies/WhaleKing/Whaleking_Boss_BP.Whaleking_Boss_BP_C:RemovePoison", Tgt::Enemy, Org::Owner, kSuppress},
+    {"/Game/Enemies/WhaleKing/Whaleking_Boss_BP.Whaleking_Boss_BP_C:KillPoisonCircles", Tgt::Enemy, Org::Owner, kSuppress},
+    {"/Game/Enemies/WhaleKing/Whaleking_Boss_BP.Whaleking_Boss_BP_C:DoHornBreak", Tgt::Enemy, Org::Owner, kSuppress},
+    // Evil Fishwife: her arena's trigger closes the temple door and raises her guardians; the guardians' resurrection
+    {"/Game/Enemies/FishWifeEvil/FishWifeEvil_Spawner.FishWifeEvil_Spawner_C:Activate", Tgt::Actor, Org::Any, kLock | kDedupe},
+    {"/Game/Enemies/PoisonFishMan/Guardian_Fishman_BP.Guardian_Fishman_BP_C:Resurrect", Tgt::Enemy, Org::Owner, kSuppress},
+    {"/Game/Enemies/PoisonFishMan/Guardian_Fishman_BP.Guardian_Fishman_BP_C:FinalKill", Tgt::Enemy, Org::Owner, kSuppress},
+    // White Tree Golem: using the big nut wakes it
+    {"/Game/Enemies/Golem/BigNut_Interact.BigNut_Interact_C:Interact", Tgt::Actor, Org::Any, kLock | kDedupe},
 };
 constexpr int kFnCount = static_cast<int>(sizeof(kFns) / sizeof(kFns[0]));
 
+constexpr const char* kTickHitboxes = "/Game/Enemies/EnemyBase.EnemyBase_C:TickHitboxes";
 constexpr double kDedupeSec = 3.0;
 constexpr float  kPullInCm = 4500.0f;    // a teammate this close when the arena locks is brought in
 constexpr float  kPullInMinCm = 600.0f;  // ... unless already standing next to the sender
@@ -117,6 +137,8 @@ struct State {
     int replaying = 0;                                     // depth of received calls being run here
     int sending = 0;                                       // depth of local table calls (only the outermost is sent)
     std::vector<int> stack;                                // per pre-hook: 1 = counted in `sending`
+    int tickHitboxes = 0;                                  // inside an enemy's TickHitboxes
+    float poisonIn = 0;
     std::unordered_map<std::string, double> localAt;       // "<object key>|<fn>" -> last run here on our own (dedupe)
     std::unordered_map<std::string, double> remoteAt;      // ... -> last run here because another machine sent it
     std::unordered_map<std::string, SDK::UObject*> actors; // actor path -> live actor (cache)
@@ -349,6 +371,7 @@ bool OnPre(hooks::CallInfo& ci, int idx) {
         if (!ci.object->IsA(SDK::AActor::StaticClass())) break;
         auto* self = static_cast<SDK::AActor*>(ci.object);
         net::MsgCall m;
+        if ((f.flags & kDirect) && s.tickHitboxes > 0) break;
         if (f.tgt == Tgt::Enemy) {
             m.target = net::kCallEnemy;
             m.enemyId = EnemyIdOfActor(self);
@@ -490,8 +513,46 @@ void Run(const Pending& p) {
         QD_INFO(kTag, "ran {} on {} from P{}", name, ue::Name(self), m.ownerSlot + 1);
 }
 
-void Tick(float) {
+// Whaleking poison: its manager damages the local player standing in any pool of its PoisonCircles list, which only
+// the owner's copy of the boss fills (the pools reach the others through HazardSync, the list does not). On a machine
+// that follows the boss, the manager's list is every pool in the world; the owner's RemovePoison / KillPoisonCircles
+// (mirrored above) switch them off. The engine fills the array itself (GetAllActorsOfClass on the list), so its memory
+// stays the engine's.
+constexpr size_t kPoisonListOffset = offsetof(SDK::AWhaleKingPoisonManager_C, PoisonCircles);
+constexpr const char* kPoisonManager = "/Game/Enemies/WhaleKing/WhaleKingPoisonManager.WhaleKingPoisonManager_C";
+constexpr const char* kPoisonCircle = "/Game/Enemies/WhaleKing/WhaleKingPoisonCircle.WhaleKingPoisonCircle_C";
+struct RawArray { void* data; int32_t num; int32_t max; };
+
+void FollowPoison() {
+    SDK::UClass* mgrCls = ue::FindClass(kPoisonManager);
+    SDK::UClass* circleCls = mgrCls ? ue::FindClass(kPoisonCircle) : nullptr;
+    if (!mgrCls || !circleCls) return;
+    std::vector<SDK::AActor*> managers;
+    ActorsOfClass(mgrCls, managers);
+    SDK::UObject* lib = SDK::UGameplayStatics::GetDefaultObj();
+    static SDK::UFunction* fn = nullptr;
+    if (!ue::IsValid(fn)) fn = ue::FindFunction(lib, "GetAllActorsOfClass");
+    if (!fn) return;
+    for (SDK::AActor* mgr : managers) {
+        if (!mgr || !mgr->Owner) continue;
+        const uint64_t boss = EnemyIdOfActor(mgr->Owner);
+        if (boss == 0 || EnemyOwnedHere(boss)) continue;
+        auto* list = reinterpret_cast<RawArray*>(reinterpret_cast<uint8_t*>(mgr) + kPoisonListOffset);
+        SDK::Params::GameplayStatics_GetAllActorsOfClass p{};
+        p.WorldContextObject = mgr;
+        p.ActorClass = circleCls;
+        std::memcpy(&p.OutActors, list, sizeof(RawArray));
+        ue::CallFunction(lib, fn, &p);
+        std::memcpy(list, &p.OutActors, sizeof(RawArray));
+    }
+}
+
+void Tick(float dt) {
     auto& s = S();
+    if (coop::InSession() && (s.poisonIn -= dt) <= 0) {
+        s.poisonIn = 0.5f;
+        FollowPoison();
+    }
     if (!coop::InSession()) {
         s.outbox.clear();
         s.inbox.clear();
@@ -537,6 +598,8 @@ void BossSyncInit() {
         s.hooks.push_back(hooks::AddPre(kFns[i].path, [i](hooks::CallInfo& ci) { return OnPre(ci, i); }));
         s.hooks.push_back(hooks::AddPost(kFns[i].path, OnPost));
     }
+    s.hooks.push_back(hooks::AddPre(kTickHitboxes, [](hooks::CallInfo&) { ++S().tickHitboxes; return false; }));
+    s.hooks.push_back(hooks::AddPost(kTickHitboxes, [](hooks::CallInfo&) { if (S().tickHitboxes > 0) --S().tickHitboxes; }));
     s.ticker = gamethread::AddTicker("bosssync", [](float dt) { Tick(dt); });
     QD_INFO(kTag, "initialized ({} functions)", kFnCount);
 }

@@ -27,6 +27,7 @@
 #include "SDK/FS_PlayerChar_parameters.hpp"
 
 #include "qdcoop/sync/EnemySync.h"
+#include "qdcoop/sync/BossSync.h"
 
 #include "qdcoop/core/Config.h"
 #include "qdcoop/core/Core.h"
@@ -119,6 +120,7 @@ constexpr const char* kInteractFns[] = {
     "/Game/Enemies/WhaleKing/WhaleKing_SG/Whaleking_SZ_BP.Whaleking_SZ_BP_C:Interact",
     "/Game/Enemies/WhaleKing/Whaleking_Boss_BP.Whaleking_Boss_BP_C:Interact",
 };
+constexpr const char* kFnBossLeftArena = "/Game/Enemies/WhaleKing/WhaleKing_SG/Whaleking_SZ_BP.Whaleking_SZ_BP_C:PlayerLeftArena";
 constexpr const char* kFnSpawnerTeleported = "/Game/Enemies/EnemySpawner.EnemySpawner_C:PlayerTeleported";
 constexpr const char* kSpawnerBlocked[] = {
     "/Game/Enemies/EnemySpawner.EnemySpawner_C:Respawn",
@@ -2338,6 +2340,13 @@ bool OnTryApplyDamagePre(hooks::CallInfo& ci) {
     HookScope scope;   // SendDamageRequest -> GetRawString is not ProcessEvent, but LocalCharacter() may be
     ShieldFrame f;
     f.enemy = ci.object;
+    // Lane B: our copy of a followed boss runs a call its owner sent (the Whaleking's horn break hurts the whale).
+    // The owner's copy took that damage already; forwarding ours would count it twice.
+    if (s.active && ci.object && BossSyncReplaying())
+        if (auto bi = s.byEnemy.find(ci.object); bi != s.byEnemy.end() && !IsMine(bi->second)) {
+            s.shield.push_back(f);
+            return true;
+        }
     if (s.active && !s.applyingRemote && ci.object && ci.params && !IsShielded(ci.object)) {
         if (auto bi = s.byEnemy.find(ci.object); bi != s.byEnemy.end()) {
             auto ei = s.entries.find(bi->second);
@@ -2412,6 +2421,25 @@ void LogBossResetKept(const SDK::UObject* spawner, const char* what) {
     if (now - lastAt < 5.0) return;
     lastAt = now;
     QD_INFO(kTag, "{} on {} not run: another player is still fighting its boss", what, ue::Name(spawner));
+}
+
+// The King of Stone (Whaleking_SZ) heals to full and gives up the fight when "the player" leaves its arena, and only
+// the local player's overlap counts. On its owner: not while another living player is near it. On a follower: never
+// (its copy follows the owner's).
+bool OnBossLeftArenaPre(hooks::CallInfo& ci) {
+    auto& s = S();
+    if (!s.active || !ci.object) return false;
+    auto bi = s.byEnemy.find(ci.object);
+    if (bi == s.byEnemy.end()) return false;
+    if (!IsMine(bi->second)) return true;
+    auto* en = static_cast<SDK::AEnemyBase_C*>(ci.object);
+    const SDK::FVector at = en->K2_GetActorLocation();
+    for (const Cand& c : s.cands)
+        if (c.alive && c.slot != s.localSlot && Dist(at, c.pos) <= kBossLockRange) {
+            LogBossResetKept(ci.object, "PlayerLeftArena");
+            return true;
+        }
+    return false;
 }
 
 // Any machine: the local player teleported (rest, death, teleporter, fast travel). The spawner then resets a boss
@@ -3676,6 +3704,7 @@ void EnemySyncInit() {
     // spawners: client blocks, host notes rests/resets
     for (const char* fn : kSpawnerBlocked) ids.push_back(hooks::AddPre(fn, OnSpawnerPre));
     ids.push_back(hooks::AddPre(kFnSpawnerTeleported, OnSpawnerTeleportedPre));
+    ids.push_back(hooks::AddPre(kFnBossLeftArena, OnBossLeftArenaPre));
 
     s.ticker = gamethread::AddTicker("enemysync", [](float dt) { Tick(dt); });
 
