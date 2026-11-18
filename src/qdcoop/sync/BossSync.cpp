@@ -66,7 +66,6 @@ constexpr Fn kFns[] = {
     // closing are never saved, so WorldSync cannot carry them.
     {"/Game/Blueprints/Door_Base.Door_Base_C:CloseDoor", Tgt::Actor, Org::Any, kDedupe},
     {"/Game/Blueprints/Door_Base.Door_Base_C:OpenDoor", Tgt::Actor, Org::Any, kDedupe},
-    {"/Game/Blueprints/Door_Base.Door_Base_C:SetToOpenState", Tgt::Actor, Org::Any, kDedupe},
     // a boss reset (the host's player left the fight and nobody else is in it): the clients' doors open again too
     {"/Game/Enemies/EnemySpawner.EnemySpawner_C:PlayerTeleportedOutOfBossArena", Tgt::Actor, Org::Host, 0},
     // Grave Guardian (Sword Shrine): its trigger closes the entrance gate and wakes it
