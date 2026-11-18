@@ -2828,7 +2828,11 @@ bool KeepsLocalPlayer(SDK::UFunction* fn) {
 void OnNativeGetPlayer(SDK::UObject* caller, SDK::UFunction* callerFn, void* result) {
     auto& s = S();
     if (s.remoteTargets <= 0 || !s.shield.empty() || s.applyingRemote) return;   // not inside a damage call
-    SDK::ACharacter* proxy = RemoteTargetOf(caller);
+    // Lane B4: the script may belong to something the boss owns rather than the boss itself (Sipeha's laser-sweep
+    // action, an anim instance): use the enemy it belongs to
+    SDK::UObject* who = caller;
+    for (int depth = 0; who && depth < 4 && !s.byEnemy.contains(who); ++depth) who = who->Outer;
+    SDK::ACharacter* proxy = RemoteTargetOf(who ? who : caller);
     if (!proxy || KeepsLocalPlayer(callerFn)) return;
     SDK::AActor** out = static_cast<SDK::AActor**>(result);
     if (*out && *out == static_cast<SDK::AActor*>(ue::LocalCharacter())) *out = proxy;   // player index 0 only

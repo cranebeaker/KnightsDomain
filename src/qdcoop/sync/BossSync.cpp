@@ -145,6 +145,28 @@ constexpr Fn kFns[] = {
     {"/Game/Enemies/BloodPoolDuo/SnailBull_Miniboss_BP.SnailBull_Miniboss_BP_C:ForcedDissolve", Tgt::Enemy, Org::Owner, kSuppress},
     {"/Game/Enemies/BloodPoolDuo/SnailBull_Miniboss_BP.SnailBull_Miniboss_BP_C:Submerge", Tgt::Enemy, Org::Owner, kSuppress},
     {"/Game/Enemies/BloodPoolDuo/SnailBull_Miniboss_BP.SnailBull_Miniboss_BP_C:UnDissolve", Tgt::Enemy, Org::Owner, kSuppress},
+
+    // Lane B4: Other World and Castle. Arena locks, music and partner spawners that started only for the player who
+    // set them off.
+    {"/Game/Enemies/DemonBosses/DemonSpider/DemonSpider_Spawner.DemonSpider_Spawner_C:Activate", Tgt::Actor, Org::Any,
+     kLock | kDedupe},
+    {"/Game/Enemies/JosamiLord/JosamiLord_Spawner.JosamiLord_Spawner_C:Activate", Tgt::Actor, Org::Any, kLock | kDedupe},
+    {"/Game/Enemies/Sipeha/Sipeha_Spawner.Sipeha_Spawner_C:Activate", Tgt::Actor, Org::Any, kLock | kDedupe},
+    {"/Game/Enemies/JosamiLord/BloodSisters/JosamiBloodLord_Sword_Spawner.JosamiBloodLord_Sword_Spawner_C:StartFight",
+     Tgt::Actor, Org::Any, kLock | kDedupe},
+    // the Queen's door shuts on her aggro, which only fires where she runs
+    {"/Game/Enemies/Queen/Queen_Spawner_BP.Queen_Spawner_BP_C:OnEnemyAggrod", Tgt::Actor, Org::Any, kLock | kDedupe},
+    // Bridge Lord's arena blockers (its intro notify drives them on its owner only)
+    {"/Game/Enemies/JosamiLord/JosamiLord_ArenaOrientationActor.JosamiLord_ArenaOrientationActor_C:BossIntroStarted",
+     Tgt::Actor, Org::Any, kDedupe},
+    {"/Game/Enemies/JosamiLord/JosamiLord_ArenaOrientationActor.JosamiLord_ArenaOrientationActor_C:BossInArena",
+     Tgt::Actor, Org::Any, kDedupe},
+    // Bridge Lord's gunfire damages through a line trace aimed at the player it shoots
+    {"/Game/Enemies/JosamiLord/JosamiLord_BP.JosamiLord_BP_C:HitPlayerWithNormalGunfire", Tgt::Enemy, Org::Owner, kSuppress},
+    {"/Game/Enemies/JosamiLord/JosamiLord_BP.JosamiLord_BP_C:HitPlayerWithArenaClearFire", Tgt::Enemy, Org::Owner, kSuppress},
+    // the Queen's second phase (her model swap is a notify of her own transition montage) and the throne she breaks
+    {"/Game/Enemies/Queen/Queen_BP.Queen_BP_C:DoStateTransition", Tgt::Enemy, Org::Owner, kSuppress},
+    {"/Game/OtherWorld/Castle_Ext/Castle_Int/Queen_Throne_BP.Queen_Throne_BP_C:Break", Tgt::Actor, Org::Any, kDedupe},
 };
 constexpr int kFnCount = static_cast<int>(sizeof(kFns) / sizeof(kFns[0]));
 
