@@ -21,6 +21,7 @@
 #include "qdcoop/core/Hooks.h"
 #include "qdcoop/core/Log.h"
 #include "qdcoop/core/Unreal.h"
+#include "qdcoop/sync/BossSync.h"
 #include "qdcoop/sync/Coop.h"
 #include "qdcoop/sync/EnemySync.h"
 
@@ -39,6 +40,9 @@ constexpr const char* kTag = "hazard";
 constexpr uint8_t kOwnerIsEnemy = 1, kInstigatorIsEnemy = 2, kIsDrop = 4;
 constexpr const char* kTrySpawningItem = "/Game/Blueprints/ItemSystem/SpawnItemDrop.SpawnItemDrop_C:TrySpawningItem";
 constexpr const char* kPickupClass = "/Game/Blueprints/CoreItemPickupActor.CoreItemPickupActor_C";
+// Reward and dialogue NPCs a boss spawns for the player who talks to its body (Shrineboss / Necronomicon / Whaleking
+// DummyNPCs). Each player talks to their own copy; a copy sent to the others stood at the world origin forever.
+constexpr const char* kNpcClass = "/Game/NPCs/NPC_Base.NPC_Base_C";
 constexpr size_t kDropperOffset = 0x90;   // SpawnItemDrop_C_TrySpawningItem::Dropper
 constexpr size_t kLocationOffset = 0x70;  // SpawnItemDrop_C_TrySpawningItem::Location
 constexpr double kRollWindowSec = 4.0;     // a drop pickup this soon after a roll ...
@@ -64,6 +68,7 @@ struct State {
     gamethread::TickerId ticker = 0;
     bool spawningRemote = false;
     SDK::UClass* pickupCls = nullptr;
+    SDK::UClass* npcCls = nullptr;
     // loot rolls made on this machine (enemies we run, chests / pots opened here; enemy id 0 = not an enemy). The
     // pickup appears a moment after the roll (the item class loads first), so new drop pickups near a recent roll
     // are matched to it and sent.
@@ -235,11 +240,20 @@ void OnSpawned(SDK::UObject* caller, SDK::UFunction*, void* result) {
     if (!actor || !ue::IsValid(actor) || !actor->Class) return;
     if (!ue::IsValid(s.pickupCls)) s.pickupCls = ue::FindClass(kPickupClass);
     if (s.pickupCls && actor->IsA(s.pickupCls)) return;   // loot: matched to its roll by ScanDrops
+    if (!ue::IsValid(s.npcCls)) s.npcCls = ue::FindClass(kNpcClass);
+    if (s.npcCls && actor->IsA(s.npcCls)) return;   // a reward / dialogue NPC: every player has their own
     uint64_t id = EnemyOfCaller(caller);
     // spawned from an anim notify or a component's script: the caller is not the enemy, the new actor's
     // Instigator / Owner usually is
     if (id == 0 && actor->Instigator) id = EnemyIdOfActor(actor->Instigator);
     if (id == 0 && actor->Owner) id = EnemyIdOfActor(actor->Owner);
+    if (id != 0 && !EnemyOwnedHere(id) && BossSyncReplaying() && !actor->IsA(SDK::APawn::StaticClass()) &&
+        !actor->IsA(SDK::ASavableActor_C::StaticClass())) {
+        // our copy of a followed enemy runs a call its owner sent (a form change, a laser): what it spawns here is
+        // the owner's attack actor, which arrives through this module. Keep one.
+        actor->K2_DestroyActor();
+        return;
+    }
     if (id == 0 || !EnemyOwnedHere(id)) return;
     // not attacks: other enemies (summons have their own sync), players, and saved world actors (loot is sent as a drop)
     if (actor->IsA(SDK::APawn::StaticClass())) return;

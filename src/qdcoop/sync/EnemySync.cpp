@@ -111,6 +111,7 @@ constexpr const char* kInteractFns[] = {
     "/Game/Enemies/WhaleKing/WhaleKing_SG/Whaleking_SZ_BP.Whaleking_SZ_BP_C:Interact",
     "/Game/Enemies/WhaleKing/Whaleking_Boss_BP.Whaleking_Boss_BP_C:Interact",
 };
+constexpr const char* kFnSpawnerTeleported = "/Game/Enemies/EnemySpawner.EnemySpawner_C:PlayerTeleported";
 constexpr const char* kSpawnerBlocked[] = {
     "/Game/Enemies/EnemySpawner.EnemySpawner_C:Respawn",
     "/Game/Enemies/EnemySpawner.EnemySpawner_C:RespawnEnemy",
@@ -2362,15 +2363,61 @@ void OnTryApplyDamagePost(hooks::CallInfo& ci) {
 
 // ------------------------------------------------------------------ spawners
 
+// Lane B: a boss fight another living player is still in. The spawner's boss is alive and a remote player stands
+// within kBossLockRange of it (or of the spawner, before the boss has moved). Every reset path of a boss spawner
+// runs on one machine for that machine's own player only: the host resting, teleporting or dying (PlayerTeleported ->
+// PlayerTeleportedOutOfBossArena), or its heartbeat finding the host far away (Reset). Each of those destroyed the
+// boss and spawned it again at full health while the other player was fighting it.
+bool OtherPlayerInBossFight(const SDK::UObject* spawner) {
+    auto& s = S();
+    if (!s.active || !spawner) return false;
+    auto si = s.spawnerIds.find(spawner);
+    if (si == s.spawnerIds.end()) return false;
+    auto ei = s.entries.find(si->second);
+    if (ei == s.entries.end()) return false;
+    Entry& e = ei->second;
+    SDK::AEnemyBase_C* en = Valid(e.enemy) ? e.enemy : nullptr;
+    if (!en || en->bDead || !IsBossLike(e, en)) return false;
+    const SDK::FVector at = en->K2_GetActorLocation();
+    const SDK::FVector home = static_cast<const SDK::AActor*>(spawner)->K2_GetActorLocation();
+    for (const Cand& c : s.cands)
+        if (c.alive && c.slot != s.localSlot && (Dist(at, c.pos) <= kBossLockRange || Dist(home, c.pos) <= kBossLockRange))
+            return true;
+    return false;
+}
+
+void LogBossResetKept(const SDK::UObject* spawner, const char* what) {
+    static double lastAt = 0;
+    const double now = Now();
+    if (now - lastAt < 5.0) return;
+    lastAt = now;
+    QD_INFO(kTag, "{} on {} not run: another player is still fighting its boss", what, ue::Name(spawner));
+}
+
+// Any machine: the local player teleported (rest, death, teleporter, fast travel). The spawner then resets a boss
+// whose fight it thinks this player has left.
+bool OnSpawnerTeleportedPre(hooks::CallInfo& ci) {
+    if (!OtherPlayerInBossFight(ci.object)) return false;
+    LogBossResetKept(ci.object, "PlayerTeleported");
+    return true;
+}
+
 // Client: the host decides when spawners (re)spawn. Host: never blocks; a rest / reset on the
-// host takes back the enemies of that spawner (handled in Tick, see HostTakeBackResets).
+// host takes back the enemies of that spawner (handled in Tick, see HostTakeBackResets), except a boss spawner whose
+// fight another player is still in (Lane B).
 bool OnSpawnerPre(hooks::CallInfo& ci) {
     auto& s = S();
     if (!s.active || !ci.object) return false;
     if (s.isHost) {
         if (ci.function && s.hostSpawnerResets.size() < 1024) {
             const std::string fn = ue::Name(ci.function);
-            if (fn == "PlayerRested" || fn == "Reset") s.hostSpawnerResets.push_back(ci.object);
+            if (fn == "PlayerRested" || fn == "Reset") {
+                if (OtherPlayerInBossFight(ci.object)) {
+                    LogBossResetKept(ci.object, fn.c_str());
+                    return true;
+                }
+                s.hostSpawnerResets.push_back(ci.object);
+            }
         }
         return false;
     }
@@ -3389,6 +3436,12 @@ SDK::AActor* EnemyActorOfId(uint64_t id) {
     return it->second.enemy;
 }
 bool EnemyOwnedHere(uint64_t id) { return IsMine(id); }
+bool EnemyIsBossLike(uint64_t id) {
+    auto& s = S();
+    auto it = s.entries.find(id);
+    if (it == s.entries.end() || !Valid(it->second.enemy)) return false;
+    return IsBossLike(it->second, it->second.enemy);
+}
 
 void ActorsOfClass(SDK::UClass* cls, std::vector<SDK::AActor*>& out) {
     out.clear();
@@ -3478,6 +3531,7 @@ void EnemySyncInit() {
     ids.push_back(hooks::AddPost(kFnTryApplyDamage, OnTryApplyDamagePost));
     // spawners: client blocks, host notes rests/resets
     for (const char* fn : kSpawnerBlocked) ids.push_back(hooks::AddPre(fn, OnSpawnerPre));
+    ids.push_back(hooks::AddPre(kFnSpawnerTeleported, OnSpawnerTeleportedPre));
 
     s.ticker = gamethread::AddTicker("enemysync", [](float dt) { Tick(dt); });
 

@@ -54,6 +54,8 @@ void ActorsOfClass(SDK::UClass* cls, std::vector<SDK::AActor*>& out);
 uint64_t     EnemyIdOfActor(const SDK::AActor* actor);
 SDK::AActor* EnemyActorOfId(uint64_t id);
 bool         EnemyOwnedHere(uint64_t id);
+// Boss, miniboss or elite (boss bar shown, or the elite / boss tier). BossSync mirrors their hitboxes.
+bool         EnemyIsBossLike(uint64_t id);
 
 #if QD_DEV
 // ---- test tooling (dev flavour only; debug/DevCommands.cpp). `filter` = case-insensitive part of the enemy's class or
