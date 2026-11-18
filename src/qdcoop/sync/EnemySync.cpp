@@ -2517,6 +2517,9 @@ void ForceRespawn(Entry& e) {
     auto& s = S();
     if (!Valid(e.spawner)) return;
     const double now = Now();
+    // Lane B3: a copy lying "dead" in a suspended death is still there (Josami Des knights in blood-pool mode revive;
+    // bosses kneel until their reward talk). A respawn put a second copy next to it.
+    if (Valid(e.enemy) && e.enemy->DeathIsSuspended) return;
     // 1.0.5: the spawner may already have a living enemy that this entry does not point at. Respawning then put a
     // second enemy on the same spot (one of them a copy nobody syncs). Use the one that is there.
     if (SDK::AEnemyBase_C* have = LivingEnemyOf(e.spawner)) {

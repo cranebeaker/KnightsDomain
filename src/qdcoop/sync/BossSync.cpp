@@ -110,6 +110,35 @@ constexpr Fn kFns[] = {
     {"/Game/Enemies/PoisonFishMan/Guardian_Fishman_BP.Guardian_Fishman_BP_C:FinalKill", Tgt::Enemy, Org::Owner, kSuppress},
     // White Tree Golem: using the big nut wakes it
     {"/Game/Enemies/Golem/BigNut_Interact.BigNut_Interact_C:Interact", Tgt::Actor, Org::Any, kLock | kDedupe},
+
+    // Lane B3: secret zones. Encounters that start on the machine whose player set them off (and whose spawners then
+    // stayed empty on the others, so the mod removed the other players' bosses as "dead on the owner").
+    {"/Game/Enemies/Dragon/Dragon_ROS/ROSDragon_Spawner.ROSDragon_Spawner_C:Activate", Tgt::Actor, Org::Any, kLock | kDedupe},
+    {"/Game/RuinsLevel/SecretZones/RoS/Dekanima/Dek_Egg/Dek_Egg_BP.Dek_Egg_BP_C:SpawnDragon", Tgt::Actor, Org::Any,
+     kLock | kDedupe},
+    {"/Game/Enemies/JosamiKnight_00/DesBoss/Josami_Des_BloodPoolSpawner.Josami_Des_BloodPoolSpawner_C:BeginFight",
+     Tgt::Actor, Org::Any, kLock | kDedupe},
+    {"/Game/Enemies/RoyalDuo/Fated_Wheeler_MinibossSpawner.Fated_Wheeler_MinibossSpawner_C:StartFight", Tgt::Actor,
+     Org::Any, kLock | kDedupe},
+    {"/Game/Enemies/BlackRobotDuo/LargeRobot_Miniboss_Spawner.LargeRobot_Miniboss_Spawner_C:StartFight", Tgt::Actor,
+     Org::Any, kLock | kDedupe},
+    {"/Game/Enemies/BloodPoolDuo/BloodPool_EnemySpawner.BloodPool_EnemySpawner_C:StartFight", Tgt::Actor, Org::Any,
+     kLock | kDedupe},
+    // Josami Des: the blood dome drops when the kneeling knight has handed over the key (only on the machine whose
+    // player talked to it, so the other player stayed caged); its knights' blood revival and the knight that kneels
+    {"/Game/Enemies/JosamiKnight_00/DesBoss/Josami_Des_BloodPoolSpawner.Josami_Des_BloodPoolSpawner_C:FinishFight",
+     Tgt::Actor, Org::Any, kDedupe},
+    {"/Game/Enemies/JosamiKnight_00/JosamiKnight_Base.JosamiKnight_Base_C:BloodReviveImmediately", Tgt::Enemy, Org::Owner,
+     kSuppress},
+    {"/Game/Enemies/JosamiKnight_00/JosamiKnight_Base.JosamiKnight_Base_C:DoBloodAngelItemGive", Tgt::Enemy, Org::Owner,
+     kSuppress},
+    // Blood Pool duo: the Stalker and the Snail Bull sink into the pool and come back out
+    {"/Game/Enemies/BloodPoolDuo/Stalker_Miniboss_BP.Stalker_Miniboss_BP_C:ForcedDissolve", Tgt::Enemy, Org::Owner, kSuppress},
+    {"/Game/Enemies/BloodPoolDuo/Stalker_Miniboss_BP.Stalker_Miniboss_BP_C:Submerge", Tgt::Enemy, Org::Owner, kSuppress},
+    {"/Game/Enemies/BloodPoolDuo/Stalker_Miniboss_BP.Stalker_Miniboss_BP_C:UnDissolve", Tgt::Enemy, Org::Owner, kSuppress},
+    {"/Game/Enemies/BloodPoolDuo/SnailBull_Miniboss_BP.SnailBull_Miniboss_BP_C:ForcedDissolve", Tgt::Enemy, Org::Owner, kSuppress},
+    {"/Game/Enemies/BloodPoolDuo/SnailBull_Miniboss_BP.SnailBull_Miniboss_BP_C:Submerge", Tgt::Enemy, Org::Owner, kSuppress},
+    {"/Game/Enemies/BloodPoolDuo/SnailBull_Miniboss_BP.SnailBull_Miniboss_BP_C:UnDissolve", Tgt::Enemy, Org::Owner, kSuppress},
 };
 constexpr int kFnCount = static_cast<int>(sizeof(kFns) / sizeof(kFns[0]));
 
