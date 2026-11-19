@@ -2721,6 +2721,57 @@ void OnNativeGetPlayer(SDK::UObject* caller, SDK::UFunction* callerFn, void* res
     if (*out && *out == static_cast<SDK::AActor*>(ue::LocalCharacter())) *out = proxy;   // player index 0 only
 }
 
+// Lane B: many boss Blueprints never ask GetTargetPlayer; they read their TargetPlayer variable (always the local
+// player) and take its location or their distance to it: K2_GetActorLocation (facing dot, look-at, projectile aim),
+// GetHorizontalDistanceTo / GetDistanceTo (attack range). While such a boss fights a remote player, its range and
+// facing checks then measured to the local player standing elsewhere, so it chased the remote player and never
+// attacked. These answer with the stand-in instead, only inside that boss's own scripts.
+SDK::ACharacter* ProxyForScript(SDK::UObject* caller, SDK::UFunction* callerFn) {
+    auto& s = S();
+    if (s.remoteTargets <= 0 || !s.shield.empty() || s.applyingRemote || !caller) return nullptr;
+    SDK::UObject* who = caller;
+    for (int depth = 0; who && depth < 4 && !s.byEnemy.contains(who); ++depth) who = who->Outer;
+    if (!who) return nullptr;
+    SDK::ACharacter* proxy = RemoteTargetOf(who);
+    if (!proxy || KeepsLocalPlayer(callerFn)) return nullptr;
+    return proxy;
+}
+
+void OnNativeGetActorLocation(SDK::UObject* caller, SDK::UFunction* callerFn, void* result) {
+    auto& s = S();
+    if (s.remoteTargets <= 0) return;   // the common case, kept cheap: this runs for every script location read
+    SDK::UObject* ctx = hooks::NativeContext();
+    if (!ctx || ctx != static_cast<SDK::UObject*>(ue::LocalCharacter())) return;
+    SDK::ACharacter* proxy = ProxyForScript(caller, callerFn);
+    if (!proxy) return;
+    SDK::FVector p = proxy->K2_GetActorLocation();
+    *static_cast<SDK::FVector*>(result) = p;
+}
+
+// Distance between the boss and "the other actor". The other actor's argument is gone once the call returned, so
+// it counts as the local player when the result equals the boss-to-local-player distance.
+template <bool kHorizontal>
+void OnNativeDistanceTo(SDK::UObject* caller, SDK::UFunction* callerFn, void* result) {
+    auto& s = S();
+    if (s.remoteTargets <= 0) return;
+    SDK::UObject* ctx = hooks::NativeContext();
+    auto* local = static_cast<SDK::AActor*>(ue::LocalCharacter());
+    if (!ctx || !Valid(local) || !static_cast<SDK::UObject*>(ctx)->IsA(SDK::AActor::StaticClass())) return;
+    SDK::ACharacter* proxy = ProxyForScript(caller, callerFn);
+    if (!proxy) return;
+    auto* from = static_cast<SDK::AActor*>(ctx);
+    if (from == local) from = static_cast<SDK::AActor*>(caller);   // the player's distance to the boss
+    if (!Valid(from) || !static_cast<SDK::UObject*>(from)->IsA(SDK::AActor::StaticClass())) return;
+    auto measure = [](const SDK::FVector& a, const SDK::FVector& b) {
+        const float dx = a.X - b.X, dy = a.Y - b.Y, dz = kHorizontal ? 0.0f : a.Z - b.Z;
+        return std::sqrt(dx * dx + dy * dy + dz * dz);
+    };
+    const SDK::FVector f = from->K2_GetActorLocation();
+    float& out = *static_cast<float*>(result);
+    if (std::fabs(out - measure(f, local->K2_GetActorLocation())) > 1.0f) return;   // measured to something else
+    out = measure(f, proxy->K2_GetActorLocation());
+}
+
 // The game asks an enemy for its target player. For a boss this machine runs, answer with the chosen player's
 // avatar when that is not the local player. The function returns a plain actor, and everything that needs more
 // than its position (damage, player state) casts first, so an avatar is simply "a target that cannot be hurt
@@ -3532,6 +3583,10 @@ void EnemySyncInit() {
     if (!s.nativeTargetHooks) {
         const bool a = hooks::AddNativePost("/Script/Engine.GameplayStatics:GetPlayerCharacter", OnNativeGetPlayer);
         const bool b = hooks::AddNativePost("/Script/Engine.GameplayStatics:GetPlayerPawn", OnNativeGetPlayer);
+        const bool l = hooks::AddNativePost("/Script/Engine.Actor:K2_GetActorLocation", OnNativeGetActorLocation);
+        const bool h = hooks::AddNativePost("/Script/Engine.Actor:GetHorizontalDistanceTo", OnNativeDistanceTo<true>);
+        const bool d = hooks::AddNativePost("/Script/Engine.Actor:GetDistanceTo", OnNativeDistanceTo<false>);
+        if (!l || !h || !d) QD_WARN(kTag, "boss range hooks: location {} horizontal {} distance {}", l, h, d);
         s.nativeTargetHooks = a && b;
     }
     ids.push_back(hooks::AddPre(kFnEnterTrapMode, OnEnterTrapModePre));
