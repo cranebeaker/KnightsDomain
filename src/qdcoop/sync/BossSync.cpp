@@ -51,14 +51,18 @@ constexpr const char* kTag = "bosssync";
 
 enum class Tgt : uint8_t { Actor, Enemy };
 enum class Org : uint8_t { Any, Host, Owner };
-constexpr uint8_t kLock = 1;        // an encounter start: pull nearby players in
-constexpr uint8_t kSuppress = 2;    // Enemy: a follower's own call is skipped
-constexpr uint8_t kBossOnly = 4;    // Enemy: only for boss-like enemies (boss bar, elite / boss tier)
-constexpr uint8_t kDedupe = 8;      // the same call on the same object within kDedupeSec runs once on each machine
-constexpr uint8_t kNoPlayer = 16;   // player parameters arrive as None (an Interact replayed without its message box)
-constexpr uint8_t kDirect = 32;     // only calls made outside the enemy's per-frame TickHitboxes
+constexpr uint16_t kLock = 1;        // an encounter start: pull nearby players in
+constexpr uint16_t kSuppress = 2;    // Enemy: a follower's own call is skipped
+constexpr uint16_t kBossOnly = 4;    // Enemy: only for boss-like enemies (boss bar, elite / boss tier)
+constexpr uint16_t kDedupe = 8;      // the same call on the same object within kDedupeSec runs once on each machine
+constexpr uint16_t kNoPlayer = 16;   // player parameters arrive as None (an Interact replayed without its message box)
+constexpr uint16_t kDirect = 32;     // only calls made outside the enemy's per-frame TickHitboxes
+constexpr uint16_t kOnce = 64;       // an encounter start that is not safe to run twice: once started (here or sent by
+                                     // another machine) a repeat is neither sent nor run until a kRearm call
+constexpr uint16_t kRearm = 128;     // the encounter on this actor ended or reset: its kOnce calls may start it again
+constexpr uint16_t kLocal = 256;     // only kRearm: never sent or skipped
 
-struct Fn { const char* path; Tgt tgt; Org org; uint8_t flags; };
+struct Fn { const char* path; Tgt tgt; Org org; uint16_t flags; };
 
 // Lane B1: Library and Mausoleum, plus what every boss uses.
 constexpr Fn kFns[] = {
@@ -117,7 +121,7 @@ constexpr Fn kFns[] = {
     {"/Game/RuinsLevel/SecretZones/RoS/Dekanima/Dek_Egg/Dek_Egg_BP.Dek_Egg_BP_C:SpawnDragon", Tgt::Actor, Org::Any,
      kLock | kDedupe},
     {"/Game/Enemies/JosamiKnight_00/DesBoss/Josami_Des_BloodPoolSpawner.Josami_Des_BloodPoolSpawner_C:BeginFight",
-     Tgt::Actor, Org::Any, kLock | kDedupe},
+     Tgt::Actor, Org::Any, kLock | kDedupe | kOnce},   // a second run raises a second set of knights
     {"/Game/Enemies/RoyalDuo/Fated_Wheeler_MinibossSpawner.Fated_Wheeler_MinibossSpawner_C:StartFight", Tgt::Actor,
      Org::Any, kLock | kDedupe},
     {"/Game/Enemies/BlackRobotDuo/LargeRobot_Miniboss_Spawner.LargeRobot_Miniboss_Spawner_C:StartFight", Tgt::Actor,
@@ -127,7 +131,9 @@ constexpr Fn kFns[] = {
     // Josami Des: the blood dome drops when the kneeling knight has handed over the key (only on the machine whose
     // player talked to it, so the other player stayed caged); its knights' blood revival and the knight that kneels
     {"/Game/Enemies/JosamiKnight_00/DesBoss/Josami_Des_BloodPoolSpawner.Josami_Des_BloodPoolSpawner_C:FinishFight",
-     Tgt::Actor, Org::Any, kDedupe},
+     Tgt::Actor, Org::Any, kDedupe | kRearm},
+    {"/Game/Enemies/JosamiKnight_00/DesBoss/Josami_Des_BloodPoolSpawner.Josami_Des_BloodPoolSpawner_C:PlayerTeleportedOutOfBossArena",
+     Tgt::Actor, Org::Any, kRearm | kLocal},
     {"/Game/Enemies/JosamiKnight_00/JosamiKnight_Base.JosamiKnight_Base_C:BloodReviveImmediately", Tgt::Enemy, Org::Owner,
      kSuppress},
     {"/Game/Enemies/JosamiKnight_00/JosamiKnight_Base.JosamiKnight_Base_C:DoBloodAngelItemGive", Tgt::Enemy, Org::Owner,
@@ -144,6 +150,7 @@ constexpr int kFnCount = static_cast<int>(sizeof(kFns) / sizeof(kFns[0]));
 
 constexpr const char* kTickHitboxes = "/Game/Enemies/EnemyBase.EnemyBase_C:TickHitboxes";
 constexpr double kDedupeSec = 3.0;
+constexpr double kOnceSec = 900.0;     // a kOnce start rearms by itself after this long
 constexpr float  kPullInCm = 4500.0f;    // a teammate this close when the arena locks is brought in
 constexpr float  kPullInMinCm = 600.0f;  // ... unless already standing next to the sender
 constexpr size_t kInboxMax = 512;
@@ -170,6 +177,7 @@ struct State {
     float poisonIn = 0;
     std::unordered_map<std::string, double> localAt;       // "<object key>|<fn>" -> last run here on our own (dedupe)
     std::unordered_map<std::string, double> remoteAt;      // ... -> last run here because another machine sent it
+    std::unordered_map<std::string, double> started;       // actor path -> when its kOnce encounter started here
     std::unordered_map<std::string, SDK::UObject*> actors; // actor path -> live actor (cache)
     std::vector<net::MsgCall> outbox;
     std::vector<Pending> inbox;
@@ -414,6 +422,8 @@ bool OnPre(hooks::CallInfo& ci, int idx) {
             m.target = net::kCallActor;
             m.actorPath = ue::PathName(self);
             if (m.actorPath.empty()) break;
+            if (f.flags & kRearm) s.started.erase(m.actorPath);
+            if (f.flags & kLocal) break;
             if (f.org == Org::Host && !coop::IsHost()) {
                 skip = true;   // the host decides; its call arrives
                 break;
@@ -427,6 +437,17 @@ bool OnPre(hooks::CallInfo& ci, int idx) {
                 skip = true;
                 break;
             }
+        }
+        if (f.flags & kOnce) {
+            // the encounter is already running here (another player's trigger, a repeat): starting it again would
+            // spawn its enemies a second time
+            if (auto it = s.started.find(m.actorPath); it != s.started.end() && now - it->second < kOnceSec) {
+                QD_INFO(kTag, "{} on {}: the encounter already started here, not run again",
+                        std::strrchr(f.path, ':') + 1, ue::Name(self));
+                skip = true;
+                break;
+            }
+            s.started[m.actorPath] = now;
         }
         s.localAt[key] = now;
         if (s.sending > 0) break;   // nested in a call that is being sent: the receivers' copy of that call runs it
@@ -514,6 +535,13 @@ void Run(const Pending& p) {
         if (auto it = s.localAt.find(key); it != s.localAt.end() && now - it->second < kDedupeSec) return;
         if (auto it = s.remoteAt.find(key); it != s.remoteAt.end() && now - it->second < kDedupeSec) return;
     }
+    if (f.flags & kOnce) {
+        if (auto it = s.started.find(m.actorPath); it != s.started.end() && now - it->second < kOnceSec) {
+            QD_INFO(kTag, "{} on {} from P{}: the encounter already started here, not run again",
+                    m.fnPath.substr(m.fnPath.rfind(':') + 1), ue::Name(self), m.ownerSlot + 1);
+            return;
+        }
+    }
     const std::string name = m.fnPath.substr(m.fnPath.rfind(':') + 1);
     SDK::UFunction* fn = ue::FindFunction(self, name);   // the most derived override, as a Blueprint call would
     if (!fn) return;
@@ -533,6 +561,8 @@ void Run(const Pending& p) {
         }
     }
     s.remoteAt[key] = now;
+    if (f.flags & kOnce) s.started[m.actorPath] = now;
+    if (f.flags & kRearm) s.started.erase(m.actorPath);
     if (f.flags & kLock) PullIn(m);
     ++s.replaying;
     ue::CallFunction(self, fn, parms.data());
@@ -587,6 +617,7 @@ void Tick(float dt) {
         s.inbox.clear();
         s.localAt.clear();
         s.remoteAt.clear();
+        s.started.clear();
         return;
     }
     if (!s.outbox.empty()) {
