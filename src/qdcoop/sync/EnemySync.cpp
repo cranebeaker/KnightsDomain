@@ -80,6 +80,11 @@ constexpr const char* kFnBossBarOff       = "/Game/Player/FS_PlayerChar.FS_Playe
 constexpr const char* kFnActivateTrap     = "/Game/Enemies/EnemyBase.EnemyBase_C:ActivateTrap";
 constexpr const char* kFnActivateEnemyAI  = "/Game/Enemies/EnemyBase.EnemyBase_C:ActivateEnemyAI";
 constexpr const char* kFnEnterTrapMode    = "/Game/Enemies/EnemyBase.EnemyBase_C:EnterTrapMode";
+// EnemyBase's chase: CreateMoveToProxyObject(TargetActor = GetChaseTarget()), and GetChaseTarget just returns the
+// TargetPlayer variable (always the local player). Its result is an OUT parameter, which a post hook cannot change,
+// so while it runs for a boss that fights a remote player, TargetPlayer holds that player's stand-in (the body
+// reads nothing else) and is put back right after.
+constexpr const char* kFnGetChaseTarget   = "/Game/Enemies/EnemyBase.EnemyBase_C:GetChaseTarget";
 // BP attack functions that play their own montage and drive their own hitboxes from montage callbacks. Replaying the
 // generic attack montage (PlayAttack) on a follower shows the swing but deals no damage, so the owner sends
 // CustomAttack(index) and followers run the same function on their copy. Index = position in this table (wire value).
@@ -2787,6 +2792,30 @@ void OnGetTargetPlayerPost(hooks::CallInfo& ci) {
     if (SDK::ACharacter* proxy = RemoteTargetOf(ci.object)) *static_cast<SDK::AActor**>(ci.result) = proxy;
 }
 
+// The boss walked (AI MoveTo) to the local player while its range and facing checks measured to the stand-in: with
+// the client fighting and the host's player elsewhere on the navmesh, it left the client, never attacked, and ended
+// pinned at the arena edge nearest the host's player.
+struct ChaseSwap {
+    SDK::AEnemyBase_C* enemy = nullptr;
+    SDK::AFS_PlayerChar_C* saved = nullptr;
+};
+ChaseSwap g_chaseSwap;   // game thread only; GetChaseTarget calls nothing, so calls never nest
+
+bool OnGetChaseTargetPre(hooks::CallInfo& ci) {
+    g_chaseSwap = {};
+    SDK::ACharacter* proxy = ci.object ? RemoteTargetOf(ci.object) : nullptr;   // owner side: boss fighting a remote player
+    if (!proxy) return false;
+    auto* en = static_cast<SDK::AEnemyBase_C*>(ci.object);
+    g_chaseSwap = {en, en->TargetPlayer};
+    en->TargetPlayer = reinterpret_cast<SDK::AFS_PlayerChar_C*>(proxy);   // read once, as a plain actor
+    return false;
+}
+
+void OnGetChaseTargetPost(hooks::CallInfo& ci) {
+    if (g_chaseSwap.enemy && g_chaseSwap.enemy == ci.object) g_chaseSwap.enemy->TargetPlayer = g_chaseSwap.saved;
+    g_chaseSwap = {};
+}
+
 bool IsWhaleking(SDK::AEnemyBase_C* en) {
     static std::unordered_map<const void*, bool> cache;
     const void* cls = en->Class;
@@ -3580,6 +3609,8 @@ void EnemySyncInit() {
     // simulator (whoever owns the enemy)
     ids.push_back(hooks::AddPre(kFnStartAttackState, OnStartAttackPre));
     ids.push_back(hooks::AddPost(kFnGetTargetPlayer, OnGetTargetPlayerPost));
+    ids.push_back(hooks::AddPre(kFnGetChaseTarget, OnGetChaseTargetPre));
+    ids.push_back(hooks::AddPost(kFnGetChaseTarget, OnGetChaseTargetPost));
     if (!s.nativeTargetHooks) {
         const bool a = hooks::AddNativePost("/Script/Engine.GameplayStatics:GetPlayerCharacter", OnNativeGetPlayer);
         const bool b = hooks::AddNativePost("/Script/Engine.GameplayStatics:GetPlayerPawn", OnNativeGetPlayer);
