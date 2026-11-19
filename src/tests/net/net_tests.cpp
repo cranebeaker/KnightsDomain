@@ -311,7 +311,7 @@ void TestRoundTrips() {
     notify.flags = kDamageHitNotifyOnly;
     RoundTrip("DamageRequest(notify)", notify, MsgType::DamageRequest);
 
-    CHECK(kProtocolVersion == 6);   // v6: WorldFlags in use, Hazard
+    CHECK(kProtocolVersion == 7);   // v7: Call; v6: WorldFlags in use, Hazard
     CHECK(static_cast<uint8_t>(MsgType::EnemyOwner) == 45);
     MsgEnemyOwner eo;
     eo.enemyId = 0x0123456789ABCDEFull;
@@ -376,6 +376,24 @@ void TestRoundTrips() {
         const auto wb = Encode(wf);
         MsgWorldFlags wback;
         CHECK(Decode(wb.data(), wb.size(), wback) && wback.full && wback.flags.size() == 2 && wback.flags[1].value == 3);
+        MsgCall ca;
+        ca.ownerSlot = 1;
+        ca.target = kCallEnemy;
+        ca.enemyId = 0x0102030405060708ull;
+        ca.actorPath = "/Game/RuinsLevel/Maps/300_LIB.300_LIB:PersistentLevel.NecroBossDoor_SM";
+        ca.fnPath = "/Game/Enemies/Necronomicon/Necro_Boss_Door.Necro_Boss_Door_C:EnableDoor";
+        ca.senderPos = {10, 20, 30};
+        ca.params = {3, 1, 0, 9};
+        const auto cb = Encode(ca);
+        MsgCall cback;
+        CHECK(PeekType(cb.data(), cb.size()) == MsgType::Call);
+        CHECK(Decode(cb.data(), cb.size(), cback));
+        CHECK(cback.ownerSlot == 1 && cback.target == kCallEnemy && cback.enemyId == ca.enemyId);
+        CHECK(cback.actorPath == ca.actorPath && cback.fnPath == ca.fnPath && cback.senderPos.y == 20 && cback.params == ca.params);
+        CHECK(!Decode(cb.data(), cb.size() - 1, cback));
+        ca.target = 7;
+        const auto bad = Encode(ca);
+        CHECK(!Decode(bad.data(), bad.size(), cback));
     }
 
     // Range checks.

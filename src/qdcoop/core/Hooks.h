@@ -58,9 +58,12 @@ bool ScriptHooksComplete();
 // entry (UFunction::Func). The callback runs on the game thread after the original, with the object whose script made
 // the call, the script function that made it, and the address of the return value. At most kMaxNativePosts functions;
 // the engine must be ready. False if the function was not found or its entry does not look like game code.
-constexpr int kMaxNativePosts = 4;
+constexpr int kMaxNativePosts = 8;
 using NativePostCallback = std::function<void(SDK::UObject* caller, SDK::UFunction* callerFunction, void* result)>;
 bool AddNativePost(const char* functionPath, NativePostCallback cb);
+// Inside a native post callback: the object the native function was called on (e.g. the actor whose location a
+// script asked for). nullptr outside a callback.
+SDK::UObject* NativeContext();
 
 // Debug: log every distinct function name seen for objects of this class name for N seconds (debugging aid).
 void TraceClass(const char* className, float seconds);

@@ -8,7 +8,7 @@
 
 namespace qd::net {
 
-constexpr uint16_t kProtocolVersion = 6;   // v6: WorldFlags in use, Hazard; v5: EnemyBlob, EnemyEvent Interacted (v4: Woke/CustomAttack, EnemyState flag bit4)
+constexpr uint16_t kProtocolVersion = 7;   // v7: Call (boss / arena Blueprint calls); v6: WorldFlags in use, Hazard; v5: EnemyBlob, EnemyEvent Interacted (v4: Woke/CustomAttack, EnemyState flag bit4)
 constexpr int      kMaxPlayers = 4;
 constexpr size_t   kMaxNameBytes = 72;    // UTF-8, 24 CJK chars
 constexpr size_t   kMaxItemPathBytes = 256;   // MsgEquip::itemPath
@@ -17,7 +17,7 @@ enum class MsgType : uint8_t {
     Hello = 1, Welcome, Reject, PeerJoined, PeerLeft, NameChanged,
     PlayerState = 20, PlayerEvent, Equip = 22,
     EnemyStates = 40, EnemyEvent, DamageRequest, EnemyOwner = 45, EnemyBlob = 46, EnemyMontage = 47,
-    WorldFlags = 60, InteractRequest, InteractResult, HpScale, Summon, Hazard = 65,
+    WorldFlags = 60, InteractRequest, InteractResult, HpScale, Summon, Hazard = 65, Call = 66,
     Heartbeat = 250,   // consumed by Session
 };
 
@@ -137,6 +137,19 @@ struct MsgHazard {
     uint32_t layout = 0; std::vector<uint8_t> vars;
     std::array<uint32_t, 4> guid{};   // drops: GUIDs[0] of the pickup on the owner's copy
 };
+// A Blueprint function from BossSync's table ran on the sender's machine (an arena door closed, a boss fight started,
+// a boss changed form, an enemy switched a hitbox on). The others run the same function on their copy of the same
+// object: a level-placed actor by its path name (target = kCallActor), or a registered enemy by id (kCallEnemy).
+// fnPath = the UFunction's path (receivers only run functions of their own table). params = the parameters, marshalled
+// by BossSync (plain values; object references as "a player" / an enemy id / a component name / an actor path).
+// senderPos = where the sender's player stood. Reliable; host relays.
+constexpr uint8_t kCallActor = 0, kCallEnemy = 1;
+constexpr size_t kMaxCallPathBytes = 300;
+constexpr size_t kMaxCallParamBytes = 600;
+struct MsgCall {
+    uint8_t ownerSlot = 0; uint8_t target = kCallActor; uint64_t enemyId = 0;
+    std::string actorPath, fnPath; Vec3f senderPos; std::vector<uint8_t> params;
+};
 
 // ---- codec ----
 MsgType PeekType(const uint8_t* data, size_t size);   // returns (MsgType)0 if size == 0
@@ -150,7 +163,7 @@ bool PeekHelloProtocol(const uint8_t* data, size_t size, uint16_t& protocol);
 QD_MSG(MsgHello) QD_MSG(MsgReject) QD_MSG(MsgWelcome) QD_MSG(MsgPeerJoined) QD_MSG(MsgPeerLeft) QD_MSG(MsgNameChanged)
 QD_MSG(MsgPlayerState) QD_MSG(MsgPlayerEvent) QD_MSG(MsgEquip)
 QD_MSG(MsgEnemyStates) QD_MSG(MsgEnemyEvent) QD_MSG(MsgDamageRequest) QD_MSG(MsgEnemyOwner) QD_MSG(MsgEnemyBlob) QD_MSG(MsgEnemyMontage)
-QD_MSG(MsgWorldFlags) QD_MSG(MsgInteractRequest) QD_MSG(MsgInteractResult) QD_MSG(MsgHpScale) QD_MSG(MsgSummon) QD_MSG(MsgHazard)
+QD_MSG(MsgWorldFlags) QD_MSG(MsgInteractRequest) QD_MSG(MsgInteractResult) QD_MSG(MsgHpScale) QD_MSG(MsgSummon) QD_MSG(MsgHazard) QD_MSG(MsgCall)
 #undef QD_MSG
 
 // Splits a large enemy snapshot into several complete MsgEnemyStates messages, each <= maxBytes when encoded

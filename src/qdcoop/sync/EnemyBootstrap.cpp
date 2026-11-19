@@ -4,6 +4,7 @@
 // Order: rules -> enemy sync -> summon tab.
 #include "qdcoop/core/Core.h"
 #include "qdcoop/core/Log.h"
+#include "qdcoop/sync/BossSync.h"
 #include "qdcoop/sync/EnemySync.h"
 #include "qdcoop/sync/HazardSync.h"
 #include "qdcoop/sync/Rules.h"
@@ -19,6 +20,7 @@ void StartWo4Modules() {
     SummonInit();
     WorldSyncInit();
     HazardSyncInit();
+    BossSyncInit();
     QD_INFO("bootstrap", "enemy modules ready (rules, enemy sync, summon)");
 }
 
