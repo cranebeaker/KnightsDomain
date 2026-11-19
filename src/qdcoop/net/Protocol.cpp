@@ -489,4 +489,31 @@ bool Decode(const uint8_t* data, size_t size, MsgHazard& out) {
     });
 }
 
+std::vector<uint8_t> Encode(const MsgCall& m) {
+    ByteWriter w = Begin(MsgType::Call, 40 + m.actorPath.size() + m.fnPath.size() + m.params.size());
+    w.U8(m.ownerSlot);
+    w.U8(m.target);
+    w.U64(m.enemyId);
+    w.Str(m.actorPath);
+    w.Str(m.fnPath);
+    WriteVec(w, m.senderPos);
+    const size_t n = m.params.size() <= kMaxCallParamBytes ? m.params.size() : 0;
+    w.U16(static_cast<uint16_t>(n));
+    for (size_t i = 0; i < n; ++i) w.U8(m.params[i]);
+    return w.Take();
+}
+bool Decode(const uint8_t* data, size_t size, MsgCall& out) {
+    return DecodeInto(data, size, MsgType::Call, out, [](ByteReader& r, MsgCall& m) {
+        uint16_t n = 0;
+        if (!(r.U8(m.ownerSlot) && m.ownerSlot < kMaxPlayers && r.U8(m.target) && m.target <= kCallEnemy &&
+              r.U64(m.enemyId) && r.Str(m.actorPath) && m.actorPath.size() <= kMaxCallPathBytes && r.Str(m.fnPath) &&
+              m.fnPath.size() <= kMaxCallPathBytes && ReadVec(r, m.senderPos) && r.U16(n) && n <= kMaxCallParamBytes))
+            return false;
+        m.params.resize(n);
+        for (auto& b : m.params)
+            if (!r.U8(b)) return false;
+        return true;
+    });
+}
+
 }  // namespace qd::net
