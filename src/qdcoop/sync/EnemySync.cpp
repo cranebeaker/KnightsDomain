@@ -2487,6 +2487,8 @@ void OnTryApplyDamagePost(hooks::CallInfo& ci) {
 // runs on one machine for that machine's own player only: the host resting, teleporting or dying (PlayerTeleported ->
 // PlayerTeleportedOutOfBossArena), or its heartbeat finding the host far away (Reset). Each of those destroyed the
 // boss and spawned it again at full health while the other player was fighting it.
+void FadeThreat(Entry& e, double now);
+
 bool OtherPlayerInBossFight(const SDK::UObject* spawner, const char** why = nullptr) {
     auto& s = S();
     auto no = [&](const char* w) { if (why) *why = w; return false; };
@@ -2510,6 +2512,15 @@ bool OtherPlayerInBossFight(const SDK::UObject* spawner, const char** why = null
     for (const Cand& c : s.cands)
         if (c.alive && c.slot != s.localSlot && (Dist(at, c.pos) <= kBossLockRange || Dist(home, c.pos) <= kBossLockRange))
             return true;
+    // Lane B5: a remote player who hit this boss recently but is missing from the list right now (state a moment
+    // old, no pose during a teleport) is still in the fight. A fresh position far away still allows the reset.
+    FadeThreat(e, Now());
+    for (uint8_t slot = 0; slot < net::kMaxPlayers; ++slot) {
+        if (slot == s.localSlot || e.threat[slot] < 1.0f) continue;
+        bool listed = false;
+        for (const Cand& c : s.cands) listed = listed || c.slot == slot;
+        if (!listed) return true;
+    }
     return no("no other player near");
 }
 
