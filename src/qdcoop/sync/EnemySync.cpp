@@ -27,6 +27,7 @@
 #include "SDK/FS_PlayerChar_parameters.hpp"
 
 #include "qdcoop/sync/EnemySync.h"
+#include "qdcoop/sync/BossSync.h"
 
 #include "qdcoop/core/Config.h"
 #include "qdcoop/core/Core.h"
@@ -80,6 +81,14 @@ constexpr const char* kFnBossBarOff       = "/Game/Player/FS_PlayerChar.FS_Playe
 constexpr const char* kFnActivateTrap     = "/Game/Enemies/EnemyBase.EnemyBase_C:ActivateTrap";
 constexpr const char* kFnActivateEnemyAI  = "/Game/Enemies/EnemyBase.EnemyBase_C:ActivateEnemyAI";
 constexpr const char* kFnEnterTrapMode    = "/Game/Enemies/EnemyBase.EnemyBase_C:EnterTrapMode";
+// EnemyBase's chase: CreateMoveToProxyObject(TargetActor = GetChaseTarget()), and GetChaseTarget just returns the
+// TargetPlayer variable (always the local player). Its result is an OUT parameter, which a post hook cannot change,
+// so while it runs for a boss that fights a remote player, TargetPlayer holds that player's stand-in (the body
+// reads nothing else) and is put back right after.
+constexpr const char* kFnGetChaseTarget   = "/Game/Enemies/EnemyBase.EnemyBase_C:GetChaseTarget";
+// EnemyBase copies its native line-of-sight component (traced to the local player) into HasPlayerlos /
+// bPlayerIsSeen / SeenPlayerRange here, and CheckLOSFlagsForAttack only lets an attack start with HasPlayerlos.
+constexpr const char* kFnUpdateCanSeePlayer = "/Game/Enemies/EnemyBase.EnemyBase_C:UpdateCanSeePlayer";
 // BP attack functions that play their own montage and drive their own hitboxes from montage callbacks. Replaying the
 // generic attack montage (PlayAttack) on a follower shows the swing but deals no damage, so the owner sends
 // CustomAttack(index) and followers run the same function on their copy. Index = position in this table (wire value).
@@ -111,6 +120,8 @@ constexpr const char* kInteractFns[] = {
     "/Game/Enemies/WhaleKing/WhaleKing_SG/Whaleking_SZ_BP.Whaleking_SZ_BP_C:Interact",
     "/Game/Enemies/WhaleKing/Whaleking_Boss_BP.Whaleking_Boss_BP_C:Interact",
 };
+constexpr const char* kFnBossLeftArena = "/Game/Enemies/WhaleKing/WhaleKing_SG/Whaleking_SZ_BP.Whaleking_SZ_BP_C:PlayerLeftArena";
+constexpr const char* kFnSpawnerTeleported = "/Game/Enemies/EnemySpawner.EnemySpawner_C:PlayerTeleported";
 constexpr const char* kSpawnerBlocked[] = {
     "/Game/Enemies/EnemySpawner.EnemySpawner_C:Respawn",
     "/Game/Enemies/EnemySpawner.EnemySpawner_C:RespawnEnemy",
@@ -389,6 +400,7 @@ struct State {
     std::unordered_map<uint64_t, OwnerRec>       owners;   // session-scoped; survives world changes
     std::unordered_map<const void*, uint64_t>    byEnemy;
     std::unordered_map<const void*, uint64_t>    spawnerIds;
+    std::unordered_map<const void*, uint64_t>    aliases;   // copied boss adds -> the owner's id (EnemySyncAlias)
     std::unordered_map<uint64_t, const void*>    idOwner;   // id -> spawner (duplicate GUID detection)
     std::unordered_map<const void*, double>      spawnerAllowUntil;
     std::unordered_map<SDK::UEnemyData_C*, DataInfo> datas;   // NOT cleared on world change (assets outlive worlds)
@@ -592,9 +604,15 @@ uint8_t ClassTier(const SDK::UObject* en) {
     // Elite = minibosses and boss-class enemies without the EnemyData.Boss flag (e.g. Cocker_Boss_00, King_Fishman).
     // Boss adds (NecroZombie_BossAdd, Fisher_KingAdd) and bestiary dummies stay normal.
     const bool add = path.find("Add_") != std::string::npos || path.find("Bestiary") != std::string::npos;
-    const bool elite = !add && (path.find("Miniboss") != std::string::npos || path.find("Duo") != std::string::npos ||
-                                path.find("Boss") != std::string::npos || path.find("King_") != std::string::npos ||
-                                path.find("Lord_") != std::string::npos);
+    // bosses whose class names say nothing (no EnemyData.Boss flag, no boss bar before their intro)
+    static constexpr const char* kBossClasses[] = {
+        "Golem_WhiteTree", "MechaKnight_DualAxe_Mossy", "MechaKnight_MausLance", "DemonSpider_", "Hellbat_",
+        "Sipeha_BP", "Dragon_Ros", "Queen_BP", "Whaleking", "FishWifeEvil", "Necronomicon_BP", "JosamiBloodPool"};
+    bool named = false;
+    for (const char* w : kBossClasses) named = named || path.find(w) != std::string::npos;
+    const bool elite = !add && (named || path.find("Miniboss") != std::string::npos ||
+                                path.find("Duo") != std::string::npos || path.find("Boss") != std::string::npos ||
+                                path.find("King_") != std::string::npos || path.find("Lord_") != std::string::npos);
     const uint8_t t = elite ? kElite : kNormal;
     s.classTier[cls] = t;
     return t;
@@ -1186,7 +1204,11 @@ void Rebuild(double now) {
                 }
             }
         }
-        if (!id) id = ue::Fnv1a64(ue::PathName(en));   // placed enemies: path names match across machines
+        if (!id) {
+            // placed enemies: path names match across machines; a boss's add copied from its owner: the owner's id
+            auto al = s.aliases.find(en);
+            id = al != s.aliases.end() ? al->second : ue::Fnv1a64(ue::PathName(en));
+        }
         Entry& e = s.entries[id];
         e.id = id;
         if (AttachEnemy(e, en)) newActors.push_back(id);
@@ -1974,7 +1996,11 @@ bool OnCustomAttackPre(hooks::CallInfo& ci, int index) {
     Entry& e = ei->second;
     e.customAttacks = true;
     if (!IsMine(bi->second) || !e.relevant) return false;
-    SendEvent(e.id, net::EnemyEventType::CustomAttack, PackAttack(index, e));
+    // its Blueprint picks a swing at random (the Grave Guardian's DoNormalAttack picks one of three montages): seed
+    // the game's rand() here and on every follower, so the replayed swing is the owner's
+    const uint32_t seed = NextSeed();
+    ue::SeedGameRand(seed);
+    SendEvent(e.id, net::EnemyEventType::CustomAttack, PackAttack(index, e), seed);
     return false;
 }
 
@@ -1987,6 +2013,9 @@ void OnEnemyInteractPost(hooks::CallInfo& ci) {
     auto ei = s.entries.find(bi->second);
     if (ei == s.entries.end()) return;
     Entry& e = ei->second;
+    // the Interact of a defeated boss is the talk that hands out its reward (Grave Guardian, Necronomicon, Whaleking,
+    // Bridge Lord ...): every player does that on their own copy, it does not start anything
+    if (auto* en = static_cast<SDK::AEnemyBase_C*>(ci.object); en->bDead) return;
     const double now = Now();
     if (now - e.interactSentAt < kInteractNoticeSec) return;
     e.interactSentAt = now;
@@ -2317,6 +2346,13 @@ bool OnTryApplyDamagePre(hooks::CallInfo& ci) {
     HookScope scope;   // SendDamageRequest -> GetRawString is not ProcessEvent, but LocalCharacter() may be
     ShieldFrame f;
     f.enemy = ci.object;
+    // Lane B: our copy of a followed boss runs a call its owner sent (the Whaleking's horn break hurts the whale).
+    // The owner's copy took that damage already; forwarding ours would count it twice.
+    if (s.active && ci.object && BossSyncReplaying())
+        if (auto bi = s.byEnemy.find(ci.object); bi != s.byEnemy.end() && !IsMine(bi->second)) {
+            s.shield.push_back(f);
+            return true;
+        }
     if (s.active && !s.applyingRemote && ci.object && ci.params && !IsShielded(ci.object)) {
         if (auto bi = s.byEnemy.find(ci.object); bi != s.byEnemy.end()) {
             auto ei = s.entries.find(bi->second);
@@ -2362,15 +2398,82 @@ void OnTryApplyDamagePost(hooks::CallInfo& ci) {
 
 // ------------------------------------------------------------------ spawners
 
+// Lane B: a boss fight another living player is still in. The spawner's boss is alive and a remote player stands
+// within kBossLockRange of it (or of the spawner, before the boss has moved). Every reset path of a boss spawner
+// runs on one machine for that machine's own player only: the host resting, teleporting or dying (PlayerTeleported ->
+// PlayerTeleportedOutOfBossArena), or its heartbeat finding the host far away (Reset). Each of those destroyed the
+// boss and spawned it again at full health while the other player was fighting it.
+bool OtherPlayerInBossFight(const SDK::UObject* spawner) {
+    auto& s = S();
+    if (!s.active || !spawner) return false;
+    auto si = s.spawnerIds.find(spawner);
+    if (si == s.spawnerIds.end()) return false;
+    auto ei = s.entries.find(si->second);
+    if (ei == s.entries.end()) return false;
+    Entry& e = ei->second;
+    SDK::AEnemyBase_C* en = Valid(e.enemy) ? e.enemy : nullptr;
+    if (!en || en->bDead || !IsBossLike(e, en)) return false;
+    const SDK::FVector at = en->K2_GetActorLocation();
+    const SDK::FVector home = static_cast<const SDK::AActor*>(spawner)->K2_GetActorLocation();
+    for (const Cand& c : s.cands)
+        if (c.alive && c.slot != s.localSlot && (Dist(at, c.pos) <= kBossLockRange || Dist(home, c.pos) <= kBossLockRange))
+            return true;
+    return false;
+}
+
+void LogBossResetKept(const SDK::UObject* spawner, const char* what) {
+    static double lastAt = 0;
+    const double now = Now();
+    if (now - lastAt < 5.0) return;
+    lastAt = now;
+    QD_INFO(kTag, "{} on {} not run: another player is still fighting its boss", what, ue::Name(spawner));
+}
+
+// The King of Stone (Whaleking_SZ) heals to full and gives up the fight when "the player" leaves its arena, and only
+// the local player's overlap counts. On its owner: not while another living player is near it. On a follower: never
+// (its copy follows the owner's).
+bool OnBossLeftArenaPre(hooks::CallInfo& ci) {
+    auto& s = S();
+    if (!s.active || !ci.object) return false;
+    auto bi = s.byEnemy.find(ci.object);
+    // a client's copy can get it while it spawns, before we know it: it opens the heal gate, and that copy then sits
+    // at full health whatever the owner sends. The host runs the boss, so only the host's copy may take it then.
+    if (bi == s.byEnemy.end()) return !s.isHost;
+    if (!IsMine(bi->second)) return true;
+    auto* en = static_cast<SDK::AEnemyBase_C*>(ci.object);
+    const SDK::FVector at = en->K2_GetActorLocation();
+    for (const Cand& c : s.cands)
+        if (c.alive && c.slot != s.localSlot && Dist(at, c.pos) <= kBossLockRange) {
+            LogBossResetKept(ci.object, "PlayerLeftArena");
+            return true;
+        }
+    return false;
+}
+
+// Any machine: the local player teleported (rest, death, teleporter, fast travel). The spawner then resets a boss
+// whose fight it thinks this player has left.
+bool OnSpawnerTeleportedPre(hooks::CallInfo& ci) {
+    if (!OtherPlayerInBossFight(ci.object)) return false;
+    LogBossResetKept(ci.object, "PlayerTeleported");
+    return true;
+}
+
 // Client: the host decides when spawners (re)spawn. Host: never blocks; a rest / reset on the
-// host takes back the enemies of that spawner (handled in Tick, see HostTakeBackResets).
+// host takes back the enemies of that spawner (handled in Tick, see HostTakeBackResets), except a boss spawner whose
+// fight another player is still in (Lane B).
 bool OnSpawnerPre(hooks::CallInfo& ci) {
     auto& s = S();
     if (!s.active || !ci.object) return false;
     if (s.isHost) {
         if (ci.function && s.hostSpawnerResets.size() < 1024) {
             const std::string fn = ue::Name(ci.function);
-            if (fn == "PlayerRested" || fn == "Reset") s.hostSpawnerResets.push_back(ci.object);
+            if (fn == "PlayerRested" || fn == "Reset") {
+                if (OtherPlayerInBossFight(ci.object)) {
+                    LogBossResetKept(ci.object, fn.c_str());
+                    return true;
+                }
+                s.hostSpawnerResets.push_back(ci.object);
+            }
         }
         return false;
     }
@@ -2662,6 +2765,57 @@ void OnNativeGetPlayer(SDK::UObject* caller, SDK::UFunction* callerFn, void* res
     if (*out && *out == static_cast<SDK::AActor*>(ue::LocalCharacter())) *out = proxy;   // player index 0 only
 }
 
+// Lane B: many boss Blueprints never ask GetTargetPlayer; they read their TargetPlayer variable (always the local
+// player) and take its location or their distance to it: K2_GetActorLocation (facing dot, look-at, projectile aim),
+// GetHorizontalDistanceTo / GetDistanceTo (attack range). While such a boss fights a remote player, its range and
+// facing checks then measured to the local player standing elsewhere, so it chased the remote player and never
+// attacked. These answer with the stand-in instead, only inside that boss's own scripts.
+SDK::ACharacter* ProxyForScript(SDK::UObject* caller, SDK::UFunction* callerFn) {
+    auto& s = S();
+    if (s.remoteTargets <= 0 || !s.shield.empty() || s.applyingRemote || !caller) return nullptr;
+    SDK::UObject* who = caller;
+    for (int depth = 0; who && depth < 4 && !s.byEnemy.contains(who); ++depth) who = who->Outer;
+    if (!who) return nullptr;
+    SDK::ACharacter* proxy = RemoteTargetOf(who);
+    if (!proxy || KeepsLocalPlayer(callerFn)) return nullptr;
+    return proxy;
+}
+
+void OnNativeGetActorLocation(SDK::UObject* caller, SDK::UFunction* callerFn, void* result) {
+    auto& s = S();
+    if (s.remoteTargets <= 0) return;   // the common case, kept cheap: this runs for every script location read
+    SDK::UObject* ctx = hooks::NativeContext();
+    if (!ctx || ctx != static_cast<SDK::UObject*>(ue::LocalCharacter())) return;
+    SDK::ACharacter* proxy = ProxyForScript(caller, callerFn);
+    if (!proxy) return;
+    SDK::FVector p = proxy->K2_GetActorLocation();
+    *static_cast<SDK::FVector*>(result) = p;
+}
+
+// Distance between the boss and "the other actor". The other actor's argument is gone once the call returned, so
+// it counts as the local player when the result equals the boss-to-local-player distance.
+template <bool kHorizontal>
+void OnNativeDistanceTo(SDK::UObject* caller, SDK::UFunction* callerFn, void* result) {
+    auto& s = S();
+    if (s.remoteTargets <= 0) return;
+    SDK::UObject* ctx = hooks::NativeContext();
+    auto* local = static_cast<SDK::AActor*>(ue::LocalCharacter());
+    if (!ctx || !Valid(local) || !static_cast<SDK::UObject*>(ctx)->IsA(SDK::AActor::StaticClass())) return;
+    SDK::ACharacter* proxy = ProxyForScript(caller, callerFn);
+    if (!proxy) return;
+    auto* from = static_cast<SDK::AActor*>(ctx);
+    if (from == local) from = static_cast<SDK::AActor*>(caller);   // the player's distance to the boss
+    if (!Valid(from) || !static_cast<SDK::UObject*>(from)->IsA(SDK::AActor::StaticClass())) return;
+    auto measure = [](const SDK::FVector& a, const SDK::FVector& b) {
+        const float dx = a.X - b.X, dy = a.Y - b.Y, dz = kHorizontal ? 0.0f : a.Z - b.Z;
+        return std::sqrt(dx * dx + dy * dy + dz * dz);
+    };
+    const SDK::FVector f = from->K2_GetActorLocation();
+    float& out = *static_cast<float*>(result);
+    if (std::fabs(out - measure(f, local->K2_GetActorLocation())) > 1.0f) return;   // measured to something else
+    out = measure(f, proxy->K2_GetActorLocation());
+}
+
 // The game asks an enemy for its target player. For a boss this machine runs, answer with the chosen player's
 // avatar when that is not the local player. The function returns a plain actor, and everything that needs more
 // than its position (damage, player state) casts first, so an avatar is simply "a target that cannot be hurt
@@ -2675,6 +2829,60 @@ void OnGetTargetPlayerPost(hooks::CallInfo& ci) {
     if (ei == s.entries.end()) return;
     (void)ei;
     if (SDK::ACharacter* proxy = RemoteTargetOf(ci.object)) *static_cast<SDK::AActor**>(ci.result) = proxy;
+}
+
+// The boss walked (AI MoveTo) to the local player while its range and facing checks measured to the stand-in: with
+// the client fighting and the host's player elsewhere on the navmesh, it left the client, never attacked, and ended
+// pinned at the arena edge nearest the host's player.
+struct ChaseSwap {
+    SDK::AEnemyBase_C* enemy = nullptr;
+    SDK::AFS_PlayerChar_C* saved = nullptr;
+};
+ChaseSwap g_chaseSwap;   // game thread only; GetChaseTarget calls nothing, so calls never nest
+
+bool OnGetChaseTargetPre(hooks::CallInfo& ci) {
+    g_chaseSwap = {};
+    SDK::ACharacter* proxy = ci.object ? RemoteTargetOf(ci.object) : nullptr;   // owner side: boss fighting a remote player
+    if (!proxy) return false;
+    auto* en = static_cast<SDK::AEnemyBase_C*>(ci.object);
+    g_chaseSwap = {en, en->TargetPlayer};
+    en->TargetPlayer = reinterpret_cast<SDK::AFS_PlayerChar_C*>(proxy);   // read once, as a plain actor
+    return false;
+}
+
+void OnGetChaseTargetPost(hooks::CallInfo& ci) {
+    if (g_chaseSwap.enemy && g_chaseSwap.enemy == ci.object) g_chaseSwap.enemy->TargetPlayer = g_chaseSwap.saved;
+    g_chaseSwap = {};
+}
+
+// The boss's sight flags come from a native component that traces to the local player. With the host's player far
+// off (or behind a wall) while the boss fights the client, it "lost sight of the player" and CheckLOSFlagsForAttack
+// held every attack: the Grave Guardian swung at the client for a few seconds and then only stood there, so whether
+// the client got hit depended on where the host stood. While it fights a remote player it sees that player.
+void OnUpdateCanSeePlayerPost(hooks::CallInfo& ci) {
+    SDK::ACharacter* proxy = ci.object ? RemoteTargetOf(ci.object) : nullptr;
+    if (!proxy) return;
+    auto bi = S().byEnemy.find(ci.object);
+    if (bi == S().byEnemy.end() || !IsMine(bi->second)) return;   // the owner's copy decides its attacks
+    auto* en = static_cast<SDK::AEnemyBase_C*>(ci.object);
+    const SDK::FVector a = en->K2_GetActorLocation(), b = proxy->K2_GetActorLocation();
+    en->HasPlayerlos = true;
+    en->bPlayerIsSeen = true;
+    en->SeenPlayerRange = std::sqrt((a.X - b.X) * (a.X - b.X) + (a.Y - b.Y) * (a.Y - b.Y) + (a.Z - b.Z) * (a.Z - b.Z));
+}
+
+// FB_BPHelpers::ActorQuickLoc(TargetPlayer): the game's own location shortcut, used where boss Blueprints aim or turn
+// an attack (Grave Guardian, dragons, robots, fishers). Like K2_GetActorLocation above; the argument is gone once
+// the call returned, so the local player is recognised by its location.
+void OnNativeActorQuickLoc(SDK::UObject* caller, SDK::UFunction* callerFn, void* result) {
+    auto& s = S();
+    if (s.remoteTargets <= 0 || !result) return;
+    auto* local = static_cast<SDK::AActor*>(ue::LocalCharacter());
+    if (!Valid(local)) return;
+    SDK::FVector& out = *static_cast<SDK::FVector*>(result);
+    const SDK::FVector l = local->K2_GetActorLocation();
+    if (std::fabs(out.X - l.X) > 1.0f || std::fabs(out.Y - l.Y) > 1.0f || std::fabs(out.Z - l.Z) > 1.0f) return;
+    if (SDK::ACharacter* proxy = ProxyForScript(caller, callerFn)) out = proxy->K2_GetActorLocation();
 }
 
 bool IsWhaleking(SDK::AEnemyBase_C* en) {
@@ -2839,6 +3047,7 @@ void ApplyEvent(const net::MsgEnemyEvent& ev) {
                 TakeControl(e, en);
                 e.customAttacks = true;
                 alignas(16) uint8_t parms[64] = {};   // DoNormalAttack / DoBigAttack take no parameters
+                if (ev.seed) ue::SeedGameRand(ev.seed);
                 s.replayingCustom = true;
                 Call(en, kCustomAttacks[ca].name, parms);
                 s.replayingCustom = false;
@@ -3015,6 +3224,29 @@ void Interpolate(const std::deque<Snap>& b, double t, net::Vec3f& pos, float& ya
     yaw = b.front().s.yaw;
 }
 
+// Lane B2: the King of Stone's tick heals it to full every frame while its PlayerIsInArena is false, and only
+// PlayerEnteredArena sets it. A copy spawned after the local player walked in never gets that call, so a followed
+// copy (whose health follows the owner's) keeps the flag set. Offset per class, -1 = the class has no such flag.
+void KeepInArenaFlag(SDK::AEnemyBase_C* en) {
+    static std::unordered_map<const void*, std::pair<int32_t, uint8_t>> cache;
+    if (!en->Class) return;
+    auto it = cache.find(en->Class);
+    if (it == cache.end()) {
+        std::pair<int32_t, uint8_t> at{-1, 0};
+        for (SDK::UStruct* st = en->Class; st && at.first < 0; st = st->SuperStruct)
+            for (SDK::FField* f = st->ChildProperties; f; f = f->Next) {
+                if (!f->ClassPrivate || ue::ToString(f->Name) != "PlayerIsInArena" ||
+                    ue::ToString(f->ClassPrivate->Name) != "BoolProperty")
+                    continue;
+                auto* b = static_cast<SDK::FBoolProperty*>(f);
+                if (b->ByteMask) at = {static_cast<SDK::FProperty*>(f)->Offset + b->ByteOffset, b->ByteMask};
+                break;
+            }
+        it = cache.emplace(en->Class, at).first;
+    }
+    if (it->second.first >= 0) reinterpret_cast<uint8_t*>(en)[it->second.first] |= it->second.second;
+}
+
 void DriveEnemy(Entry& e, SDK::AEnemyBase_C* en, uint8_t owner, double now) {
     auto& s = S();
     net::Vec3f pos{}, vel{};
@@ -3031,6 +3263,7 @@ void DriveEnemy(Entry& e, SDK::AEnemyBase_C* en, uint8_t owner, double now) {
     SDK::FHitResult hit{};
     en->K2_SetActorLocationAndRotation(ToF(pos), SDK::FRotator(0.0f, yaw, 0.0f), false, &hit, true);
     if (SDK::UCharacterMovementComponent* cm = en->CharacterMovement; Valid(cm)) cm->Velocity = ToF(vel);   // anim BP speed
+    if (IsWhaleking(en)) KeepInArenaFlag(en);
     const net::EnemyState& last = e.snaps.back().s;
     if (!s.isHost && owner == 0) ClientMatchMaxHp(e, en, last.maxHp, now);
     if (!IsShielded(en)) {
@@ -3389,6 +3622,21 @@ SDK::AActor* EnemyActorOfId(uint64_t id) {
     return it->second.enemy;
 }
 bool EnemyOwnedHere(uint64_t id) { return IsMine(id); }
+uint64_t EnemyIdForNewActor(const SDK::AActor* actor) { return actor ? ue::Fnv1a64(ue::PathName(actor)) : 0; }
+void EnemySyncAlias(const SDK::AActor* actor, uint64_t id) {
+    auto& s = S();
+    if (!actor || !id) return;
+    if (s.aliases.size() > 512)
+        for (auto it = s.aliases.begin(); it != s.aliases.end();)
+            it = Valid(static_cast<const SDK::UObject*>(it->first)) ? std::next(it) : s.aliases.erase(it);
+    s.aliases[actor] = id;
+}
+bool EnemyIsBossLike(uint64_t id) {
+    auto& s = S();
+    auto it = s.entries.find(id);
+    if (it == s.entries.end() || !Valid(it->second.enemy)) return false;
+    return IsBossLike(it->second, it->second.enemy);
+}
 
 void ActorsOfClass(SDK::UClass* cls, std::vector<SDK::AActor*>& out) {
     out.clear();
@@ -3454,9 +3702,18 @@ void EnemySyncInit() {
     // simulator (whoever owns the enemy)
     ids.push_back(hooks::AddPre(kFnStartAttackState, OnStartAttackPre));
     ids.push_back(hooks::AddPost(kFnGetTargetPlayer, OnGetTargetPlayerPost));
+    ids.push_back(hooks::AddPre(kFnGetChaseTarget, OnGetChaseTargetPre));
+    ids.push_back(hooks::AddPost(kFnGetChaseTarget, OnGetChaseTargetPost));
+    ids.push_back(hooks::AddPost(kFnUpdateCanSeePlayer, OnUpdateCanSeePlayerPost));
     if (!s.nativeTargetHooks) {
         const bool a = hooks::AddNativePost("/Script/Engine.GameplayStatics:GetPlayerCharacter", OnNativeGetPlayer);
         const bool b = hooks::AddNativePost("/Script/Engine.GameplayStatics:GetPlayerPawn", OnNativeGetPlayer);
+        const bool l = hooks::AddNativePost("/Script/Engine.Actor:K2_GetActorLocation", OnNativeGetActorLocation);
+        const bool h = hooks::AddNativePost("/Script/Engine.Actor:GetHorizontalDistanceTo", OnNativeDistanceTo<true>);
+        const bool d = hooks::AddNativePost("/Script/Engine.Actor:GetDistanceTo", OnNativeDistanceTo<false>);
+        const bool q = hooks::AddNativePost("/Script/FB_Utils.FB_BPHelpers:ActorQuickLoc", OnNativeActorQuickLoc);
+        if (!l || !h || !d || !q)
+            QD_WARN(kTag, "boss range hooks: location {} horizontal {} distance {} quick location {}", l, h, d, q);
         s.nativeTargetHooks = a && b;
     }
     ids.push_back(hooks::AddPre(kFnEnterTrapMode, OnEnterTrapModePre));
@@ -3478,6 +3735,8 @@ void EnemySyncInit() {
     ids.push_back(hooks::AddPost(kFnTryApplyDamage, OnTryApplyDamagePost));
     // spawners: client blocks, host notes rests/resets
     for (const char* fn : kSpawnerBlocked) ids.push_back(hooks::AddPre(fn, OnSpawnerPre));
+    ids.push_back(hooks::AddPre(kFnSpawnerTeleported, OnSpawnerTeleportedPre));
+    ids.push_back(hooks::AddPre(kFnBossLeftArena, OnBossLeftArenaPre));
 
     s.ticker = gamethread::AddTicker("enemysync", [](float dt) { Tick(dt); });
 
