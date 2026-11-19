@@ -604,9 +604,15 @@ uint8_t ClassTier(const SDK::UObject* en) {
     // Elite = minibosses and boss-class enemies without the EnemyData.Boss flag (e.g. Cocker_Boss_00, King_Fishman).
     // Boss adds (NecroZombie_BossAdd, Fisher_KingAdd) and bestiary dummies stay normal.
     const bool add = path.find("Add_") != std::string::npos || path.find("Bestiary") != std::string::npos;
-    const bool elite = !add && (path.find("Miniboss") != std::string::npos || path.find("Duo") != std::string::npos ||
-                                path.find("Boss") != std::string::npos || path.find("King_") != std::string::npos ||
-                                path.find("Lord_") != std::string::npos);
+    // bosses whose class names say nothing (no EnemyData.Boss flag, no boss bar before their intro)
+    static constexpr const char* kBossClasses[] = {
+        "Golem_WhiteTree", "MechaKnight_DualAxe_Mossy", "MechaKnight_MausLance", "DemonSpider_", "Hellbat_",
+        "Sipeha_BP", "Dragon_Ros", "Queen_BP", "Whaleking", "FishWifeEvil", "Necronomicon_BP", "JosamiBloodPool"};
+    bool named = false;
+    for (const char* w : kBossClasses) named = named || path.find(w) != std::string::npos;
+    const bool elite = !add && (named || path.find("Miniboss") != std::string::npos ||
+                                path.find("Duo") != std::string::npos || path.find("Boss") != std::string::npos ||
+                                path.find("King_") != std::string::npos || path.find("Lord_") != std::string::npos);
     const uint8_t t = elite ? kElite : kNormal;
     s.classTier[cls] = t;
     return t;
@@ -2430,7 +2436,9 @@ bool OnBossLeftArenaPre(hooks::CallInfo& ci) {
     auto& s = S();
     if (!s.active || !ci.object) return false;
     auto bi = s.byEnemy.find(ci.object);
-    if (bi == s.byEnemy.end()) return false;
+    // a client's copy can get it while it spawns, before we know it: it opens the heal gate, and that copy then sits
+    // at full health whatever the owner sends. The host runs the boss, so only the host's copy may take it then.
+    if (bi == s.byEnemy.end()) return !s.isHost;
     if (!IsMine(bi->second)) return true;
     auto* en = static_cast<SDK::AEnemyBase_C*>(ci.object);
     const SDK::FVector at = en->K2_GetActorLocation();
