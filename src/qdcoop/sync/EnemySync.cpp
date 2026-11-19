@@ -85,6 +85,9 @@ constexpr const char* kFnEnterTrapMode    = "/Game/Enemies/EnemyBase.EnemyBase_C
 // so while it runs for a boss that fights a remote player, TargetPlayer holds that player's stand-in (the body
 // reads nothing else) and is put back right after.
 constexpr const char* kFnGetChaseTarget   = "/Game/Enemies/EnemyBase.EnemyBase_C:GetChaseTarget";
+// EnemyBase copies its native line-of-sight component (traced to the local player) into HasPlayerlos /
+// bPlayerIsSeen / SeenPlayerRange here, and CheckLOSFlagsForAttack only lets an attack start with HasPlayerlos.
+constexpr const char* kFnUpdateCanSeePlayer = "/Game/Enemies/EnemyBase.EnemyBase_C:UpdateCanSeePlayer";
 // BP attack functions that play their own montage and drive their own hitboxes from montage callbacks. Replaying the
 // generic attack montage (PlayAttack) on a follower shows the swing but deals no damage, so the owner sends
 // CustomAttack(index) and followers run the same function on their copy. Index = position in this table (wire value).
@@ -2816,6 +2819,36 @@ void OnGetChaseTargetPost(hooks::CallInfo& ci) {
     g_chaseSwap = {};
 }
 
+// The boss's sight flags come from a native component that traces to the local player. With the host's player far
+// off (or behind a wall) while the boss fights the client, it "lost sight of the player" and CheckLOSFlagsForAttack
+// held every attack: the Grave Guardian swung at the client for a few seconds and then only stood there, so whether
+// the client got hit depended on where the host stood. While it fights a remote player it sees that player.
+void OnUpdateCanSeePlayerPost(hooks::CallInfo& ci) {
+    SDK::ACharacter* proxy = ci.object ? RemoteTargetOf(ci.object) : nullptr;
+    if (!proxy) return;
+    auto bi = S().byEnemy.find(ci.object);
+    if (bi == S().byEnemy.end() || !IsMine(bi->second)) return;   // the owner's copy decides its attacks
+    auto* en = static_cast<SDK::AEnemyBase_C*>(ci.object);
+    const SDK::FVector a = en->K2_GetActorLocation(), b = proxy->K2_GetActorLocation();
+    en->HasPlayerlos = true;
+    en->bPlayerIsSeen = true;
+    en->SeenPlayerRange = std::sqrt((a.X - b.X) * (a.X - b.X) + (a.Y - b.Y) * (a.Y - b.Y) + (a.Z - b.Z) * (a.Z - b.Z));
+}
+
+// FB_BPHelpers::ActorQuickLoc(TargetPlayer): the game's own location shortcut, used where boss Blueprints aim or turn
+// an attack (Grave Guardian, dragons, robots, fishers). Like K2_GetActorLocation above; the argument is gone once
+// the call returned, so the local player is recognised by its location.
+void OnNativeActorQuickLoc(SDK::UObject* caller, SDK::UFunction* callerFn, void* result) {
+    auto& s = S();
+    if (s.remoteTargets <= 0 || !result) return;
+    auto* local = static_cast<SDK::AActor*>(ue::LocalCharacter());
+    if (!Valid(local)) return;
+    SDK::FVector& out = *static_cast<SDK::FVector*>(result);
+    const SDK::FVector l = local->K2_GetActorLocation();
+    if (std::fabs(out.X - l.X) > 1.0f || std::fabs(out.Y - l.Y) > 1.0f || std::fabs(out.Z - l.Z) > 1.0f) return;
+    if (SDK::ACharacter* proxy = ProxyForScript(caller, callerFn)) out = proxy->K2_GetActorLocation();
+}
+
 bool IsWhaleking(SDK::AEnemyBase_C* en) {
     static std::unordered_map<const void*, bool> cache;
     const void* cls = en->Class;
@@ -3611,13 +3644,16 @@ void EnemySyncInit() {
     ids.push_back(hooks::AddPost(kFnGetTargetPlayer, OnGetTargetPlayerPost));
     ids.push_back(hooks::AddPre(kFnGetChaseTarget, OnGetChaseTargetPre));
     ids.push_back(hooks::AddPost(kFnGetChaseTarget, OnGetChaseTargetPost));
+    ids.push_back(hooks::AddPost(kFnUpdateCanSeePlayer, OnUpdateCanSeePlayerPost));
     if (!s.nativeTargetHooks) {
         const bool a = hooks::AddNativePost("/Script/Engine.GameplayStatics:GetPlayerCharacter", OnNativeGetPlayer);
         const bool b = hooks::AddNativePost("/Script/Engine.GameplayStatics:GetPlayerPawn", OnNativeGetPlayer);
         const bool l = hooks::AddNativePost("/Script/Engine.Actor:K2_GetActorLocation", OnNativeGetActorLocation);
         const bool h = hooks::AddNativePost("/Script/Engine.Actor:GetHorizontalDistanceTo", OnNativeDistanceTo<true>);
         const bool d = hooks::AddNativePost("/Script/Engine.Actor:GetDistanceTo", OnNativeDistanceTo<false>);
-        if (!l || !h || !d) QD_WARN(kTag, "boss range hooks: location {} horizontal {} distance {}", l, h, d);
+        const bool q = hooks::AddNativePost("/Script/FB_Utils.FB_BPHelpers:ActorQuickLoc", OnNativeActorQuickLoc);
+        if (!l || !h || !d || !q)
+            QD_WARN(kTag, "boss range hooks: location {} horizontal {} distance {} quick location {}", l, h, d, q);
         s.nativeTargetHooks = a && b;
     }
     ids.push_back(hooks::AddPre(kFnEnterTrapMode, OnEnterTrapModePre));
