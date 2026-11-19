@@ -16,4 +16,8 @@ void BossSyncShutdown();
 // during such a replay: the owner's own copies of them arrive through HazardSync.
 bool BossSyncReplaying();
 
+// Seconds since this machine last ran an encounter start (a spawner's StartFight / BeginFight / Activate) that
+// another machine sent; very large when it never did. EnemySync holds a remote Woke around it (see PendingWake).
+double BossSyncSinceEncounterReplay();
+
 }  // namespace qd::sync

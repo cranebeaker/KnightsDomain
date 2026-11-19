@@ -171,6 +171,7 @@ struct State {
     std::vector<hooks::HookId> hooks;
     std::unordered_map<std::string, int> byPath;           // fnPath -> kFns index
     int replaying = 0;                                     // depth of received calls being run here
+    double encounterReplayAt = 0;                          // last encounter start (kLock) run here for another machine
     int sending = 0;                                       // depth of local table calls (only the outermost is sent)
     std::vector<int> stack;                                // per pre-hook: 1 = counted in `sending`
     int tickHitboxes = 0;                                  // inside an enemy's TickHitboxes
@@ -563,7 +564,10 @@ void Run(const Pending& p) {
     s.remoteAt[key] = now;
     if (f.flags & kOnce) s.started[m.actorPath] = now;
     if (f.flags & kRearm) s.started.erase(m.actorPath);
-    if (f.flags & kLock) PullIn(m);
+    if (f.flags & kLock) {
+        PullIn(m);
+        s.encounterReplayAt = now;
+    }
     ++s.replaying;
     ue::CallFunction(self, fn, parms.data());
     --s.replaying;
@@ -647,6 +651,11 @@ void Tick(float dt) {
 }  // namespace
 
 bool BossSyncReplaying() { return S().replaying > 0; }
+
+double BossSyncSinceEncounterReplay() {
+    const double at = S().encounterReplayAt;
+    return at > 0 ? Now() - at : 1e9;
+}
 
 void BossSyncInit() {
     auto& s = S();

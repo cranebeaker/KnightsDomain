@@ -154,6 +154,7 @@ constexpr float  kStatsInterval    = 0.25f;
 constexpr float  kRelevantRange    = 6000.0f;   // cm: enemies within 60 m of any player are synced / evaluated
 constexpr double kHitAggroSec      = 6.0;       // rule 1: the last hitter within this window owns the enemy
 constexpr double kOwnerSwitchSec   = 6.0;       // rule 4: min. time between two owner changes (not for hits)
+constexpr double kHostThereGraceSec = 4.0;       // host-run enemies: the host counts as there this long after it was seen (see hostThereAt)
 // Measured in a play test (662 changes, up to 19 per enemy): proximity hand-over needs a clear winner.
 constexpr float  kNearAssignRange  = 3000.0f;   // cm: "nearest" only hands an enemy to a player within 30 m of it
 constexpr float  kNearMarginCm     = 800.0f;    // ... who is at least 8 m closer than the current owner
@@ -279,6 +280,7 @@ struct Entry {
     uint8_t targetSlot = 0xFF;                     // owner: who the boss fights (0xFF = not chosen yet)
     uint8_t followTarget = 0xFF;                   // follower: who the owner's copy is attacking (1.0.6)
     bool    hostRun = false;                       // host: bosses and dormant-type enemies stay on the host (1.0.6)
+    double  hostThereAt = 0;                       // host: last time the host's player was within boss range of it
     double  targetSince = -100;
     uint8_t interactSlot = 0xFF;                   // host: who talked to it last
     double  interactAt = -100;
@@ -1427,6 +1429,11 @@ void HostEvaluateOwners(double now) {
             bool hostThere = false;
             for (const Cand& k : s.cands)
                 if (k.slot == 0 && k.alive && Dist(pos, k.pos) <= kBossLockRange) hostThere = true;
+            // Lane B3: the host's own entry drops out of the list for a moment while its player is moved (a
+            // teleport, `kd egoto`). Without a grace period a client's hit took the boss in that gap and the host took
+            // it back a moment later, eight times in one fight (Cocker), until the host's copy stood frozen.
+            if (hostThere) e.hostThereAt = now;
+            else if (special && now - e.hostThereAt < kHostThereGraceSec) hostThere = true;
             e.hostRun = special && hostThere;
             if (e.hostRun) {
                 e.bossLockSlot = 0xFF;
@@ -1762,6 +1769,65 @@ void WakeLocal(Entry& e, SDK::AEnemyBase_C* en, bool damaged, const char* why) {
     s.wakingLocal = false;
     if (!e.controlled && en->bIsAIDisabled) en->bIsAIDisabled = false;
     QD_INFO(kTag, "{:016X} ({}) woken: {}", e.id, ue::Name(en), why);
+}
+
+// Lane B3: a remote Woke is applied a moment later, not at once. When the other machine started the encounter, its
+// start (StartFight, BeginFight) is replayed here too and raises the boss by the Blueprint's own path. Waking it a
+// second time in the same frame (ActivateEnemyAI + ActivateTrap) broke that rise: the Royal Duo's Wheeler kept the
+// collision-off, flying state of its bed, never moved and later fell through the floor. So while an encounter start
+// ran here recently the wake waits for the Blueprint's rise and is only forced when that does not come.
+constexpr double kRemoteWakeDelaySec = 0.5;    // a Woke and its encounter start arrive together; let both land
+constexpr double kEncounterRiseSec   = 5.0;    // how long the Blueprint's own rise is waited for
+struct PendingWake {
+    uint64_t id = 0;
+    const SDK::UObject* enemy = nullptr;
+    bool damaged = false;
+    double due = 0, giveUp = 0;
+};
+std::vector<PendingWake> g_pendingWakes;
+
+void QueueRemoteWake(Entry& e, SDK::AEnemyBase_C* en, bool damaged) {
+    for (PendingWake& w : g_pendingWakes)
+        if (w.id == e.id && w.enemy == en) return;
+    if (g_pendingWakes.size() >= 64) {   // never expected; wake at once rather than drop it
+        WakeLocal(e, en, damaged, "remote Woke");
+        return;
+    }
+    const double now = Now();
+    g_pendingWakes.push_back({e.id, en, damaged, now + kRemoteWakeDelaySec, now + kEncounterRiseSec});
+}
+
+void PendingWakeTick(double now) {
+    auto& s = S();
+    for (size_t i = 0; i < g_pendingWakes.size();) {
+        PendingWake& w = g_pendingWakes[i];
+        bool done = true;
+        auto it = s.entries.find(w.id);
+        if (it != s.entries.end() && it->second.enemy == w.enemy && Valid(it->second.enemy) &&
+            !it->second.enemy->bDead && it->second.wokenFor != w.enemy) {
+            Entry& e = it->second;
+            SDK::AEnemyBase_C* en = e.enemy;
+            const bool encounter = BossSyncSinceEncounterReplay() < kEncounterRiseSec;
+            const bool risen = !en->InTrapMode && (e.controlled || !en->bIsAIDisabled);
+            if (now < w.due) {
+                done = false;
+            } else if (encounter && risen) {
+                e.wokenFor = en;   // the replayed encounter start raised it here
+                QD_INFO(kTag, "{:016X} ({}): remote Woke not applied, the encounter start raised it here", e.id,
+                        ue::Name(en));
+            } else if (encounter && now < w.giveUp) {
+                done = false;      // its rise may still be on the way
+            } else {
+                WakeLocal(e, en, w.damaged, encounter ? "remote Woke (encounter start did not raise it)" : "remote Woke");
+            }
+        }
+        if (done) {
+            g_pendingWakes[i] = g_pendingWakes.back();
+            g_pendingWakes.pop_back();
+        } else {
+            ++i;
+        }
+    }
 }
 
 // Any machine: its copy of an enemy left trap mode. Our own WakeLocal is not echoed.
@@ -3028,7 +3094,7 @@ void ApplyEvent(const net::MsgEnemyEvent& ev) {
             }
             break;
         case net::EnemyEventType::Woke:
-            WakeLocal(e, en, ev.arg != 0, "remote Woke");
+            if (en && !en->bDead && e.wokenFor != en) QueueRemoteWake(e, en, ev.arg != 0);
             break;
         case net::EnemyEventType::Interacted: {
             if (s.isHost && ev.ownerSlot < net::kMaxPlayers) {
@@ -3555,6 +3621,7 @@ void Tick(float dt) {
             FollowerTick(now);
             UpdateTargetProxies();
             RiseWatchTick(now);
+            PendingWakeTick(now);
         } else {
             s.simulated = s.followed = s.controlledCount = 0;
         }
