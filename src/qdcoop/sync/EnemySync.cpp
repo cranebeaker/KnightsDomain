@@ -1959,6 +1959,26 @@ void OnActivateAiPost(hooks::CallInfo& ci) {
 // the boss's range the reset is not run.
 const SDK::UObject* g_trapModeSkipped = nullptr;
 
+void FadeThreat(Entry& e, double now);
+
+// Lane B: a remote player missing from the candidate list right now (no pose while a teleport moves them,
+// state a moment old) is still in this boss's fight when they hit it recently or their state is fresh, alive and in our
+// area. A listed player is judged by their position. Returns their slot, or 0xFF.
+uint8_t UnlistedFighter(Entry& e) {
+    auto& s = S();
+    FadeThreat(e, Now());
+    for (uint8_t slot = 0; slot < net::kMaxPlayers; ++slot) {
+        if (slot == s.localSlot) continue;
+        bool listed = false;
+        for (const Cand& c : s.cands) listed = listed || c.slot == slot;
+        if (listed) continue;
+        bool dead = false, sameArea = false;
+        const bool fresh = RemotePlayerInfo(slot, dead, sameArea);
+        if (e.threat[slot] >= 1.0f || (fresh && !dead && sameArea)) return slot;
+    }
+    return 0xFF;
+}
+
 bool OnEnterTrapModePre(hooks::CallInfo& ci) {
     auto& s = S();
     g_trapModeSkipped = nullptr;
@@ -1979,6 +1999,9 @@ bool OnEnterTrapModePre(hooks::CallInfo& ci) {
                 keep = true;
                 who = c.slot;
             }
+        // the client was dropped from the list for a moment (its pose is missing while it teleports): the host's
+        // copy went dormant alone and the client's copy, which only follows wakes, stayed up
+        if (!keep && (who = UnlistedFighter(e)) != 0xFF) keep = true;
     } else if (e.controlled && !e.snaps.empty() && Now() - e.seenAt < kOwnerSilentSec) {
         keep = (e.snaps.back().s.flags & (1 | 32)) == 32;   // its owner's copy is up and alive
         who = OwnerOf(bi->second).slot;
@@ -2487,8 +2510,6 @@ void OnTryApplyDamagePost(hooks::CallInfo& ci) {
 // runs on one machine for that machine's own player only: the host resting, teleporting or dying (PlayerTeleported ->
 // PlayerTeleportedOutOfBossArena), or its heartbeat finding the host far away (Reset). Each of those destroyed the
 // boss and spawned it again at full health while the other player was fighting it.
-void FadeThreat(Entry& e, double now);
-
 bool OtherPlayerInBossFight(const SDK::UObject* spawner, const char** why = nullptr) {
     auto& s = S();
     auto no = [&](const char* w) { if (why) *why = w; return false; };
@@ -2512,15 +2533,9 @@ bool OtherPlayerInBossFight(const SDK::UObject* spawner, const char** why = null
     for (const Cand& c : s.cands)
         if (c.alive && c.slot != s.localSlot && (Dist(at, c.pos) <= kBossLockRange || Dist(home, c.pos) <= kBossLockRange))
             return true;
-    // Lane B5: a remote player who hit this boss recently but is missing from the list right now (state a moment
-    // old, no pose during a teleport) is still in the fight. A fresh position far away still allows the reset.
-    FadeThreat(e, Now());
-    for (uint8_t slot = 0; slot < net::kMaxPlayers; ++slot) {
-        if (slot == s.localSlot || e.threat[slot] < 1.0f) continue;
-        bool listed = false;
-        for (const Cand& c : s.cands) listed = listed || c.slot == slot;
-        if (!listed) return true;
-    }
+    // Lane B5: a remote player missing from the list right now is still in the fight (see UnlistedFighter). A fresh
+    // position far away still allows the reset.
+    if (UnlistedFighter(e) != 0xFF) return true;
     return no("no other player near");
 }
 
