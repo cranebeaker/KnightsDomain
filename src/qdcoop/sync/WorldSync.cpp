@@ -145,10 +145,25 @@ SDK::UFS_LocationData* FindLoc(const std::string& path) {
     return static_cast<SDK::UFS_LocationData*>(o);
 }
 
+// Named save data that belongs to one player. A boss's reward NPC (NPC_MultiReward_Base) hands out the reward at
+// index <counter> and adds one: with the counter shared, the second player to talk to the boss was past the end of
+// the list and got nothing (no Stone Duck key from the Grave Guardian, no acid vial from the Necronomicon).
+constexpr const char* kPerPlayerNamed[] = {
+    "ShrineBossRewardCount", "NecronomiconRewardCount", "WhaleKingRewardCount", "WhaleKingSGRewardCount",
+    "FishwifeEvilRewardCount", "ROSDragonRewardCount", "DesJosamiRewardCount", "Sipeha_RewardCount",
+    "LargeRustyRobotRewardCount", "WitchBonerRewardCount",
+};
+bool PerPlayerNamed(const std::string& n) {
+    for (const char* k : kPerPlayerNamed)
+        if (n == k) return true;
+    return false;
+}
+
 Snapshot Read(SDK::UFS_SaveSlot_C* s) {
     Snapshot o;
     for (auto& kv : s->SavableActorStates) o.states[ToGuid(kv.Key())] = kv.Value();
-    for (auto& kv : s->NamedSaveData) o.named[ue::ToString(kv.Key())] = kv.Value();
+    for (auto& kv : s->NamedSaveData)
+        if (std::string n = ue::ToString(kv.Key()); !PerPlayerNamed(n)) o.named[n] = kv.Value();
     for (SDK::UFS_LocationData* l : s->SavePointsVisited)
         if (auto p = LocPath(l); !p.empty()) o.visited.insert(p);
     for (SDK::UFS_LocationData* l : s->UnlockedTeleporters)
@@ -365,7 +380,7 @@ bool ApplyEntry(SDK::UFS_SaveSlot_C* save, const std::string& name, int32_t valu
             if (!ParseGuid(key, g)) return true;
             return ApplyState(g, value);
         }
-        case 'n': return ApplyNamed(key, value);
+        case 'n': return PerPlayerNamed(key) || ApplyNamed(key, value);
         case 'x': {
             Guid g{};
             if (!ParseGuid(key, g)) return true;

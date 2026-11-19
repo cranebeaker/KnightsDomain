@@ -54,6 +54,13 @@ void ActorsOfClass(SDK::UClass* cls, std::vector<SDK::AActor*>& out);
 uint64_t     EnemyIdOfActor(const SDK::AActor* actor);
 SDK::AActor* EnemyActorOfId(uint64_t id);
 bool         EnemyOwnedHere(uint64_t id);
+// Boss, miniboss or elite (boss bar shown, or the elite / boss tier). BossSync mirrors their hitboxes.
+bool         EnemyIsBossLike(uint64_t id);
+// Adds a boss spawns while it fights (Necronomicon zombies, Whaleking fish) have no spawner, so their id is a hash of
+// their object path, and runtime object names differ per machine. HazardSync copies an add from the boss's owner to
+// the others and aliases the copy to the owner's id, so the add is synced like any other enemy.
+uint64_t     EnemyIdForNewActor(const SDK::AActor* actor);   // the id a spawner-less enemy gets here
+void         EnemySyncAlias(const SDK::AActor* actor, uint64_t id);
 
 #if QD_DEV
 // ---- test tooling (dev flavour only; debug/DevCommands.cpp). `filter` = case-insensitive part of the enemy's class or

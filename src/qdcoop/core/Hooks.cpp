@@ -734,14 +734,21 @@ struct NativeSlot {
     NativePostCallback cb;
 };
 NativeSlot g_native[kMaxNativePosts];
+SDK::UObject* g_nativeContext = nullptr;   // game thread only
 
 template <int N>
 void NativeThunk(SDK::UObject* context, FFrame& stack, void* result) {
     NativeSlot& slot = g_native[N];
     slot.original(context, stack, result);
-    if (slot.cb && result && GetCurrentThreadId() == core::GameThreadId()) slot.cb(FrameObject(stack), FrameNode(stack), result);
+    if (slot.cb && result && GetCurrentThreadId() == core::GameThreadId()) {
+        SDK::UObject* const outer = g_nativeContext;   // a callback may itself make native calls
+        g_nativeContext = context;
+        slot.cb(FrameObject(stack), FrameNode(stack), result);
+        g_nativeContext = outer;
+    }
 }
-constexpr NativeFn kNativeThunks[kMaxNativePosts] = {&NativeThunk<0>, &NativeThunk<1>, &NativeThunk<2>, &NativeThunk<3>};
+constexpr NativeFn kNativeThunks[kMaxNativePosts] = {&NativeThunk<0>, &NativeThunk<1>, &NativeThunk<2>, &NativeThunk<3>,
+                                                     &NativeThunk<4>, &NativeThunk<5>, &NativeThunk<6>, &NativeThunk<7>};
 
 bool InGameImage(const void* p) {
     const auto* base = reinterpret_cast<const uint8_t*>(GetModuleHandleW(nullptr));
@@ -769,6 +776,8 @@ void Shutdown() {
     MH_DisableHook(MH_ALL_HOOKS);
     QD_INFO(kTag, "hooks disabled");
 }
+
+SDK::UObject* NativeContext() { return g_nativeContext; }
 
 bool AddNativePost(const char* functionPath, NativePostCallback cb) {
     if (!functionPath || !cb) return false;
