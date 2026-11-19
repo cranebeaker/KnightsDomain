@@ -3224,6 +3224,29 @@ void Interpolate(const std::deque<Snap>& b, double t, net::Vec3f& pos, float& ya
     yaw = b.front().s.yaw;
 }
 
+// Lane B2: the King of Stone's tick heals it to full every frame while its PlayerIsInArena is false, and only
+// PlayerEnteredArena sets it. A copy spawned after the local player walked in never gets that call, so a followed
+// copy (whose health follows the owner's) keeps the flag set. Offset per class, -1 = the class has no such flag.
+void KeepInArenaFlag(SDK::AEnemyBase_C* en) {
+    static std::unordered_map<const void*, std::pair<int32_t, uint8_t>> cache;
+    if (!en->Class) return;
+    auto it = cache.find(en->Class);
+    if (it == cache.end()) {
+        std::pair<int32_t, uint8_t> at{-1, 0};
+        for (SDK::UStruct* st = en->Class; st && at.first < 0; st = st->SuperStruct)
+            for (SDK::FField* f = st->ChildProperties; f; f = f->Next) {
+                if (!f->ClassPrivate || ue::ToString(f->Name) != "PlayerIsInArena" ||
+                    ue::ToString(f->ClassPrivate->Name) != "BoolProperty")
+                    continue;
+                auto* b = static_cast<SDK::FBoolProperty*>(f);
+                if (b->ByteMask) at = {static_cast<SDK::FProperty*>(f)->Offset + b->ByteOffset, b->ByteMask};
+                break;
+            }
+        it = cache.emplace(en->Class, at).first;
+    }
+    if (it->second.first >= 0) reinterpret_cast<uint8_t*>(en)[it->second.first] |= it->second.second;
+}
+
 void DriveEnemy(Entry& e, SDK::AEnemyBase_C* en, uint8_t owner, double now) {
     auto& s = S();
     net::Vec3f pos{}, vel{};
@@ -3240,6 +3263,7 @@ void DriveEnemy(Entry& e, SDK::AEnemyBase_C* en, uint8_t owner, double now) {
     SDK::FHitResult hit{};
     en->K2_SetActorLocationAndRotation(ToF(pos), SDK::FRotator(0.0f, yaw, 0.0f), false, &hit, true);
     if (SDK::UCharacterMovementComponent* cm = en->CharacterMovement; Valid(cm)) cm->Velocity = ToF(vel);   // anim BP speed
+    if (IsWhaleking(en)) KeepInArenaFlag(en);
     const net::EnemyState& last = e.snaps.back().s;
     if (!s.isHost && owner == 0) ClientMatchMaxHp(e, en, last.maxHp, now);
     if (!IsShielded(en)) {
