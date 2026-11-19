@@ -21,6 +21,7 @@
 #include "qdcoop/core/Hooks.h"
 #include "qdcoop/core/Log.h"
 #include "qdcoop/core/Unreal.h"
+#include "qdcoop/sync/BossSync.h"
 #include "qdcoop/sync/Coop.h"
 #include "qdcoop/sync/EnemySync.h"
 
@@ -36,9 +37,20 @@ namespace qd::sync {
 namespace {
 
 constexpr const char* kTag = "hazard";
-constexpr uint8_t kOwnerIsEnemy = 1, kInstigatorIsEnemy = 2, kIsDrop = 4;
+constexpr uint8_t kOwnerIsEnemy = 1, kInstigatorIsEnemy = 2, kIsDrop = 4, kIsAdd = 8;
 constexpr const char* kTrySpawningItem = "/Game/Blueprints/ItemSystem/SpawnItemDrop.SpawnItemDrop_C:TrySpawningItem";
 constexpr const char* kPickupClass = "/Game/Blueprints/CoreItemPickupActor.CoreItemPickupActor_C";
+// Reward and dialogue NPCs a boss spawns for the player who talks to its body (Shrineboss / Necronomicon / Whaleking
+// DummyNPCs). Each player talks to their own copy; a copy sent to the others stood at the world origin forever.
+constexpr const char* kNpcClass = "/Game/NPCs/NPC_Base.NPC_Base_C";
+constexpr const char* kEnemyBaseClass = "/Game/Enemies/EnemyBase.EnemyBase_C";
+// Attack actors that only make sense on the machine that runs the enemy: the Whaleking's fish carrier holds the add it
+// releases (the add itself is copied, see kIsAdd), a golem's rock is held in its hand until its throw (a follower's copy
+// throws its own when it replays the attack).
+constexpr const char* kLocalOnly[] = {
+    "/Game/Enemies/WhaleKing/FishSpawnProjectile.FishSpawnProjectile_C",
+    "/Game/Enemies/Golem/Golem_Rock_Projectile.Golem_Rock_Projectile_C",
+};
 constexpr size_t kDropperOffset = 0x90;   // SpawnItemDrop_C_TrySpawningItem::Dropper
 constexpr size_t kLocationOffset = 0x70;  // SpawnItemDrop_C_TrySpawningItem::Location
 constexpr double kRollWindowSec = 4.0;     // a drop pickup this soon after a roll ...
@@ -64,6 +76,8 @@ struct State {
     gamethread::TickerId ticker = 0;
     bool spawningRemote = false;
     SDK::UClass* pickupCls = nullptr;
+    SDK::UClass* npcCls = nullptr;
+    SDK::UClass* enemyCls = nullptr;
     // loot rolls made on this machine (enemies we run, chests / pots opened here; enemy id 0 = not an enemy). The
     // pickup appears a moment after the roll (the item class loads first), so new drop pickups near a recent roll
     // are matched to it and sent.
@@ -235,15 +249,29 @@ void OnSpawned(SDK::UObject* caller, SDK::UFunction*, void* result) {
     if (!actor || !ue::IsValid(actor) || !actor->Class) return;
     if (!ue::IsValid(s.pickupCls)) s.pickupCls = ue::FindClass(kPickupClass);
     if (s.pickupCls && actor->IsA(s.pickupCls)) return;   // loot: matched to its roll by ScanDrops
+    if (!ue::IsValid(s.npcCls)) s.npcCls = ue::FindClass(kNpcClass);
+    if (s.npcCls && actor->IsA(s.npcCls)) return;   // a reward / dialogue NPC: every player has their own
     uint64_t id = EnemyOfCaller(caller);
     // spawned from an anim notify or a component's script: the caller is not the enemy, the new actor's
     // Instigator / Owner usually is
     if (id == 0 && actor->Instigator) id = EnemyIdOfActor(actor->Instigator);
     if (id == 0 && actor->Owner) id = EnemyIdOfActor(actor->Owner);
+    if (id != 0 && !EnemyOwnedHere(id) && BossSyncReplaying() && !actor->IsA(SDK::APawn::StaticClass()) &&
+        !actor->IsA(SDK::ASavableActor_C::StaticClass())) {
+        // our copy of a followed enemy runs a call its owner sent (a form change, a laser): what it spawns here is
+        // the owner's attack actor, which arrives through this module. Keep one.
+        actor->K2_DestroyActor();
+        return;
+    }
     if (id == 0 || !EnemyOwnedHere(id)) return;
-    // not attacks: other enemies (summons have their own sync), players, and saved world actors (loot is sent as a drop)
-    if (actor->IsA(SDK::APawn::StaticClass())) return;
+    // not attacks: players and other pawns, and saved world actors (loot is sent as a drop). An enemy the boss spawns
+    // (an add) is copied as one, with the id it gets here.
+    if (!ue::IsValid(s.enemyCls)) s.enemyCls = ue::FindClass(kEnemyBaseClass);
+    const bool add = s.enemyCls && actor->IsA(s.enemyCls);
+    if (actor->IsA(SDK::APawn::StaticClass()) && !add) return;
     if (SDK::UClass* sav = SDK::ASavableActor_C::StaticClass(); sav && actor->IsA(sav)) return;
+    for (const char* lo : kLocalOnly)
+        if (ue::PathName(actor->Class) == lo) return;
     SDK::AActor* enemy = EnemyActorOfId(id);
     if (!enemy) return;
     const auto slot = coop::LocalSlot();
@@ -252,6 +280,11 @@ void OnSpawned(SDK::UObject* caller, SDK::UFunction*, void* result) {
     net::MsgHazard m;
     m.enemyId = id;
     m.ownerSlot = *slot;
+    if (add) {
+        m.flags |= kIsAdd;
+        const uint64_t addId = EnemyIdForNewActor(actor);
+        m.guid = {static_cast<uint32_t>(addId), static_cast<uint32_t>(addId >> 32), 0, 0};
+    }
     m.classPath = ue::PathName(actor->Class);
     if (m.classPath.empty() || m.classPath.size() > net::kMaxClassPathBytes) return;
     if (actor->Owner == enemy) m.flags |= kOwnerIsEnemy;
@@ -341,7 +374,16 @@ void SpawnRemote(const net::MsgHazard& m) {
     SDK::AActor* enemy = EnemyActorOfId(m.enemyId);
     const bool isDrop = (m.flags & kIsDrop) != 0;
     if (!w || !cls) return;
-    if (!enemy && !isDrop) return;   // an attack of an enemy that is not loaded here: nothing to show
+    // an attack of an enemy that is not loaded here: nothing to show. An add is an enemy of its own: it is spawned
+    // even when our copy of whatever spawned it is not mapped yet (a spawner's second boss, right after a respawn).
+    if (!enemy && !isDrop) {
+        if (!(m.flags & kIsAdd)) return;
+        SDK::ACharacter* me = ue::LocalCharacter();   // ... and only near us (the spawner's area is loaded here)
+        if (!me) return;
+        const SDK::FVector p = me->K2_GetActorLocation();
+        const float dx = m.pos.x - p.X, dy = m.pos.y - p.Y, dz = m.pos.z - p.Z;
+        if (dx * dx + dy * dy + dz * dz > 10000.f * 10000.f) return;
+    }
     if (isDrop) {
         const double now = NowSec();
         for (const auto& r : s.sentDrops) {
@@ -352,7 +394,8 @@ void SpawnRemote(const net::MsgHazard& m) {
             }
         }
     }
-    if (!cls->IsSubclassOf(SDK::AActor::StaticClass()) || cls->IsSubclassOf(SDK::APawn::StaticClass())) return;
+    const bool add = (m.flags & kIsAdd) != 0;
+    if (!cls->IsSubclassOf(SDK::AActor::StaticClass()) || (cls->IsSubclassOf(SDK::APawn::StaticClass()) && !add)) return;
     for (float v : {m.pos.x, m.pos.y, m.pos.z, m.rot.x, m.rot.y, m.rot.z, m.scale.x, m.scale.y, m.scale.z})
         if (!std::isfinite(v)) return;
 
@@ -381,6 +424,7 @@ void SpawnRemote(const net::MsgHazard& m) {
             return true;
         };
         if (drop) setGuid();
+        if (add) EnemySyncAlias(a, static_cast<uint64_t>(m.guid[0]) | (static_cast<uint64_t>(m.guid[1]) << 32));
         SDK::UGameplayStatics::FinishSpawningActor(a, t);
         if (drop && !setGuid()) QD_WARN(kTag, "drop {} spawned without a GUID slot", m.classPath);
         if (drop) {
