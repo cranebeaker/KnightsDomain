@@ -2487,22 +2487,30 @@ void OnTryApplyDamagePost(hooks::CallInfo& ci) {
 // runs on one machine for that machine's own player only: the host resting, teleporting or dying (PlayerTeleported ->
 // PlayerTeleportedOutOfBossArena), or its heartbeat finding the host far away (Reset). Each of those destroyed the
 // boss and spawned it again at full health while the other player was fighting it.
-bool OtherPlayerInBossFight(const SDK::UObject* spawner) {
+bool OtherPlayerInBossFight(const SDK::UObject* spawner, const char** why = nullptr) {
     auto& s = S();
-    if (!s.active || !spawner) return false;
+    auto no = [&](const char* w) { if (why) *why = w; return false; };
+    if (!s.active || !spawner) return no("no session");
     auto si = s.spawnerIds.find(spawner);
-    if (si == s.spawnerIds.end()) return false;
+    if (si == s.spawnerIds.end()) return no("spawner not known");
     auto ei = s.entries.find(si->second);
-    if (ei == s.entries.end()) return false;
+    if (ei == s.entries.end()) return no("no entry");
     Entry& e = ei->second;
     SDK::AEnemyBase_C* en = Valid(e.enemy) ? e.enemy : nullptr;
-    if (!en || en->bDead || !IsBossLike(e, en)) return false;
+    // just after a reset the spawner holds a new boss before our entry is attached to it: ask the spawner
+    if (!en) {
+        SDK::AEnemyBase_C* m = static_cast<const SDK::AEnemySpawner_C*>(spawner)->CurrentManagedEnemy;
+        if (Valid(m)) en = m;
+    }
+    if (!en) return no("no boss");
+    if (en->bDead) return no("boss dead");
+    if (!IsBossLike(e, en)) return no("not a boss");
     const SDK::FVector at = en->K2_GetActorLocation();
     const SDK::FVector home = static_cast<const SDK::AActor*>(spawner)->K2_GetActorLocation();
     for (const Cand& c : s.cands)
         if (c.alive && c.slot != s.localSlot && (Dist(at, c.pos) <= kBossLockRange || Dist(home, c.pos) <= kBossLockRange))
             return true;
-    return false;
+    return no("no other player near");
 }
 
 void LogBossResetKept(const SDK::UObject* spawner, const char* what) {
@@ -2537,7 +2545,12 @@ bool OnBossLeftArenaPre(hooks::CallInfo& ci) {
 // Any machine: the local player teleported (rest, death, teleporter, fast travel). The spawner then resets a boss
 // whose fight it thinks this player has left.
 bool OnSpawnerTeleportedPre(hooks::CallInfo& ci) {
-    if (!OtherPlayerInBossFight(ci.object)) return false;
+    const char* why = "";
+    if (!OtherPlayerInBossFight(ci.object, &why)) {
+        if (S().active && S().spawnerIds.contains(ci.object))
+            QD_INFO(kTag, "PlayerTeleported on {} runs: {}", ue::Name(ci.object), why);
+        return false;
+    }
     LogBossResetKept(ci.object, "PlayerTeleported");
     return true;
 }
