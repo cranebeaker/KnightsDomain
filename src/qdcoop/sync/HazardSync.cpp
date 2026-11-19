@@ -374,7 +374,16 @@ void SpawnRemote(const net::MsgHazard& m) {
     SDK::AActor* enemy = EnemyActorOfId(m.enemyId);
     const bool isDrop = (m.flags & kIsDrop) != 0;
     if (!w || !cls) return;
-    if (!enemy && !isDrop) return;   // an attack of an enemy that is not loaded here: nothing to show
+    // an attack of an enemy that is not loaded here: nothing to show. An add is an enemy of its own: it is spawned
+    // even when our copy of whatever spawned it is not mapped yet (a spawner's second boss, right after a respawn).
+    if (!enemy && !isDrop) {
+        if (!(m.flags & kIsAdd)) return;
+        SDK::ACharacter* me = ue::LocalCharacter();   // ... and only near us (the spawner's area is loaded here)
+        if (!me) return;
+        const SDK::FVector p = me->K2_GetActorLocation();
+        const float dx = m.pos.x - p.X, dy = m.pos.y - p.Y, dz = m.pos.z - p.Z;
+        if (dx * dx + dy * dy + dz * dz > 10000.f * 10000.f) return;
+    }
     if (isDrop) {
         const double now = NowSec();
         for (const auto& r : s.sentDrops) {

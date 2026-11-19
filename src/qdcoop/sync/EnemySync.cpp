@@ -1739,6 +1739,21 @@ bool OnStartAttackPre(hooks::CallInfo& ci) {
     return false;
 }
 
+// Bridge Lord: one spawner can hold two enemies of one class - a dormant decoy and the one its Activate
+// spawns. The machines need not agree which of the two carries the spawner's id, so a remote Woke for that id can
+// name the decoy here. While this copy is still dormant and a same-class enemy of the same spawner has already
+// risen here, the fight runs on that one: the decoy stays asleep.
+bool RisenTwinHere(const SDK::AEnemyBase_C* en) {
+    if (!en || !en->InTrapMode || !Valid(en->OwningSpawner)) return false;
+    for (const auto& [id, o] : S().entries) {
+        const SDK::AEnemyBase_C* t = Valid(o.enemy) ? o.enemy : nullptr;
+        if (t && t != en && !t->bDead && t->Class == en->Class && t->OwningSpawner == en->OwningSpawner &&
+            o.wokenFor == t)
+            return true;
+    }
+    return false;
+}
+
 // Wakes this machine's copy (follower side, or the owner when another player's copy rose first). Once per instance.
 void WakeLocal(Entry& e, SDK::AEnemyBase_C* en, bool damaged, const char* why) {
     if (!en || en->bDead || e.wokenFor == en) return;
@@ -1811,6 +1826,9 @@ void PendingWakeTick(double now) {
             const bool risen = !en->InTrapMode && (e.controlled || !en->bIsAIDisabled);
             if (now < w.due) {
                 done = false;
+            } else if (RisenTwinHere(en)) {
+                QD_INFO(kTag, "{:016X} ({}): remote Woke not applied, a twin from its spawner has already risen here",
+                        e.id, ue::Name(en));
             } else if (encounter && risen) {
                 e.wokenFor = en;   // the replayed encounter start raised it here
                 QD_INFO(kTag, "{:016X} ({}): remote Woke not applied, the encounter start raised it here", e.id,
@@ -3098,6 +3116,11 @@ void ApplyEvent(const net::MsgEnemyEvent& ev) {
             }
             break;
         case net::EnemyEventType::Woke:
+            if (RisenTwinHere(en)) {
+                QD_INFO(kTag, "{:016X} ({}): remote Woke not applied, a twin from its spawner has already risen here",
+                        e.id, ue::Name(en));
+                break;
+            }
             if (en && !en->bDead && e.wokenFor != en) QueueRemoteWake(e, en, ev.arg != 0);
             break;
         case net::EnemyEventType::Interacted: {
