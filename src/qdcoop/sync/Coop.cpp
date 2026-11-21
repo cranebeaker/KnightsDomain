@@ -786,6 +786,17 @@ void RunDevAutoActions() {
 
 }  // namespace
 
+#if QD_DEV
+bool DevJoinUdp(const std::string& ip, uint16_t port) {
+    auto& h = H();
+    if (!h.udp || !h.session || !h.sessionOk || h.coopDisabled || core::OwnershipState() != core::Ownership::Passed)
+        return false;
+    QD_INFO(kTag, "dev: join {}:{}", ip, port);
+    h.session->JoinUdp(ip, port);
+    return true;
+}
+#endif
+
 // ================================================================== public contract
 
 void Init() {

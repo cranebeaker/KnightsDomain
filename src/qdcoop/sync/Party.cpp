@@ -1,0 +1,1211 @@
+// Knights' Domain: party features. See Party.h.
+//
+// Down, not dead: the game kills the player through FS_PlayerChar_C:Kill. While a teammate in the same area is up, that
+// call is skipped and the player is down instead: no movement, attacks, items or interaction, no damage taken, and
+// everyone sees them lying. A teammate who holds Interact next to them for kReviveSec revives them at kReviveFraction of
+// their health. Nobody left who could revive them (all down, gone, in another area) -> the game's own death runs.
+//
+// Party rest / party save: a player who presses Rest or Save in a checkpoint's menu tells the others; each of them is
+// taken there with the game's own fast travel to that checkpoint, opens the checkpoint's menu and presses the same
+// button through the menu's own handler, then leaves through the menu's own Leave, so HUD, controls and enemies come
+// back the way the game does it. Someone dead, in a cutscene or already resting is skipped and told.
+//
+// Trading: two players within kTradeRangeCm open a trade (request, accept), each offers consumables from their own
+// inventory, both confirm the current offers, the requester commits, the other hands over and answers Done, then the
+// requester hands over. An offer that changes takes both confirmations back.
+// Include order: SDK headers FIRST (see GameQueries.cpp for why).
+#include "SDK/Engine_classes.hpp"
+#include "SDK/QueensDomain_classes.hpp"
+#include "SDK/QueensDomain_parameters.hpp"
+#include "SDK/FB_Utils_classes.hpp"
+#include "SDK/FB_Utils_parameters.hpp"
+#include "SDK/UMG_parameters.hpp"
+#include "SDK/FS_PlayerChar_classes.hpp"
+#include "SDK/FS_PlayerChar_parameters.hpp"
+#include "SDK/Checkpoint_classes.hpp"
+#include "SDK/Checkpoint_parameters.hpp"
+#include "SDK/SaveMenu_classes.hpp"
+#include "SDK/SaveMenu_parameters.hpp"
+#include "SDK/SaveFunctions_classes.hpp"
+#include "SDK/SaveFunctions_parameters.hpp"
+#include "SDK/FS_SaveSlot_classes.hpp"
+#include "SDK/FS_ItemData_classes.hpp"
+
+#include "qdcoop/sync/Party.h"
+
+#include "qdcoop/core/Core.h"
+#include "qdcoop/core/Hooks.h"
+#include "qdcoop/core/Log.h"
+#include "qdcoop/core/Unreal.h"
+#include "qdcoop/sync/Coop.h"
+#include "qdcoop/sync/EnemySync.h"
+#include "qdcoop/sync/PlayerSync.h"
+#include "qdcoop/ui/I18n.h"
+#include "qdcoop/ui/Overlay.h"
+
+#include "imgui.h"
+
+#include <algorithm>
+#include <chrono>
+#include <cmath>
+#include <map>
+#include <mutex>
+#include <random>
+#include <sstream>
+#include <format>
+#include <string>
+#include <vector>
+
+namespace qd::sync {
+namespace {
+
+constexpr const char* kTag = "party";
+
+constexpr const char* kPlayerClass = "/Game/Player/FS_PlayerChar.FS_PlayerChar_C";
+constexpr const char* kFnKill = "/Game/Player/FS_PlayerChar.FS_PlayerChar_C:Kill";
+constexpr const char* kFnPlayerDamage = "/Game/Player/FS_PlayerChar.FS_PlayerChar_C:TryApplyDamage";
+constexpr const char* kCheckpointClass = "/Game/LD45/Blueprints/Checkpoint/Checkpoint.Checkpoint_C";
+constexpr const char* kSaveMenuClass = "/Game/UI/Menus/SaveMenu.SaveMenu_C";
+constexpr const char* kSaveFunctionsClass = "/Game/Blueprints/SaveSystem/SaveFunctions.SaveFunctions_C";
+constexpr const char* kFnRestButton =
+    "/Game/UI/Menus/SaveMenu.SaveMenu_C:BndEvt__SaveMenu_RestButton_K2Node_ComponentBoundEvent_0_CommonButtonBaseClicked__DelegateSignature";
+constexpr const char* kFnSaveButton =
+    "/Game/UI/Menus/SaveMenu.SaveMenu_C:BndEvt__SavedPopup_SaveButton_K2Node_ComponentBoundEvent_3_CommonButtonBaseClicked__DelegateSignature";
+constexpr const char* kRestButtonName =
+    "BndEvt__SaveMenu_RestButton_K2Node_ComponentBoundEvent_0_CommonButtonBaseClicked__DelegateSignature";
+constexpr const char* kSaveButtonName =
+    "BndEvt__SavedPopup_SaveButton_K2Node_ComponentBoundEvent_3_CommonButtonBaseClicked__DelegateSignature";
+
+// The player's own controls that a downed player loses (look and the pause / status menus stay).
+constexpr const char* kBlockedWhileDown[] = {
+    "AddMovementInputAxes",
+    "InpActEvt_Jump_K2Node_InputActionEvent_0", "InpActEvt_Jump_K2Node_InputActionEvent_1",
+    "InpActEvt_Attack_K2Node_InputActionEvent_4", "InpActEvt_Attack_K2Node_InputActionEvent_5",
+    "InpActEvt_NextDagger_K2Node_InputActionEvent_6", "InpActEvt_LastDagger_K2Node_InputActionEvent_7",
+    "InpActEvt_NormalDaggerThrow_K2Node_InputActionEvent_8", "InpActEvt_UltraAttack_K2Node_InputActionEvent_9",
+    "InpActEvt_NextWeapon_K2Node_InputActionEvent_10", "InpActEvt_LastWeapon_K2Node_InputActionEvent_11",
+    "InpActEvt_SecondaryAttack_K2Node_InputActionEvent_12", "InpActEvt_SecondaryAttack_K2Node_InputActionEvent_13",
+    "InpActEvt_WindDash_K2Node_InputActionEvent_14",
+    "InpActEvt_EquipThrowWeapon1_K2Node_InputActionEvent_15", "InpActEvt_EquipThrowWeapon2_K2Node_InputActionEvent_16",
+    "InpActEvt_EquipThrowWeapon3_K2Node_InputActionEvent_17", "InpActEvt_EquipWeapon1_K2Node_InputActionEvent_18",
+    "InpActEvt_EquipWeapon2_K2Node_InputActionEvent_19", "InpActEvt_EquipWeapon3_K2Node_InputActionEvent_20",
+    "InpActEvt_UseItem_K2Node_InputActionEvent_21",
+    "InpActEvt_LastItem_K2Node_InputActionEvent_28", "InpActEvt_NextItem_K2Node_InputActionEvent_29",
+    "InpActEvt_Interact_K2Node_InputActionEvent_30", "InpActEvt_Interact_K2Node_InputActionEvent_31",
+};
+
+constexpr float  kReviveRangeCm     = 250.0f;
+constexpr float  kReviveZRangeCm    = 200.0f;
+constexpr double kReviveSec         = 3.0;
+constexpr float  kReviveFraction    = 0.35f;
+constexpr double kReviveImmuneSec   = 2.0;    // no damage right after standing up
+constexpr double kBleedOutGraceSec  = 4.0;    // nobody could revive us this long -> the game's own death
+constexpr float  kTradeRangeCm      = 750.0f;
+constexpr float  kTradeBreakCm      = 1000.0f;
+constexpr float  kRestNearCm        = 1500.0f; // a follower this close to the checkpoint walks over instead of travelling
+constexpr double kRestTravelMaxSec  = 40.0;
+constexpr double kRestMenuMaxSec    = 6.0;
+constexpr double kRestRunMaxSec     = 25.0;
+
+using Clock = std::chrono::steady_clock;
+double Now() { return std::chrono::duration<double>(Clock::now().time_since_epoch()).count(); }
+
+float Dist(const SDK::FVector& a, const SDK::FVector& b) {
+    const float dx = a.X - b.X, dy = a.Y - b.Y, dz = a.Z - b.Z;
+    return std::sqrt(dx * dx + dy * dy + dz * dz);
+}
+SDK::FVector V(const net::Vec3f& v) { return SDK::FVector(v.x, v.y, v.z); }
+net::Vec3f V(const SDK::FVector& v) { return {v.X, v.Y, v.Z}; }
+
+// ------------------------------------------------------------------ state
+
+enum class TradeStage { None, Outgoing, Incoming, Open };
+struct OfferLine { std::string path, name; int count = 0; };
+struct InvLine { std::string path, name; int have = 0; };
+
+struct Trade {
+    TradeStage stage = TradeStage::None;
+    uint32_t   id = 0;
+    uint8_t    peer = 0xFF;
+    bool       requester = false;
+    std::map<std::string, int> mine;     // path -> count offered
+    std::vector<OfferLine>     theirs;
+    int        myVersion = 0, theirVersion = 0;
+    bool       myConfirm = false, theirConfirm = false;
+    bool       committing = false;       // requester: commit sent, waiting for Done
+    double     openedAt = 0;
+};
+
+enum class RestStep { Idle, Travel, FindCheckpoint, OpenMenu, Press, WaitDone, Close };
+struct RestJob {
+    RestStep step = RestStep::Idle;
+    bool     save = false;               // party save (no rest)
+    uint8_t  from = 0;
+    std::string locPath;
+    SDK::FVector pos;
+    double   stepAt = 0;
+    bool     sawResting = false;
+    SDK::ACheckpoint_C* checkpoint = nullptr;
+};
+
+struct UiTeammate { uint8_t slot = 0; std::string name; bool downed = false; bool near = false; };
+struct UiSnap {
+    bool inSession = false, inGame = false, localDowned = false;
+    std::vector<UiTeammate> mates;
+    Trade trade;
+    std::string peerName;
+    std::vector<InvLine> inv;
+};
+
+struct State {
+    bool inited = false;
+    gamethread::TickerId ticker = 0;
+    std::vector<hooks::HookId> hooks;
+    SDK::UClass* playerCls = nullptr;
+
+    // dev switches
+    bool   downEnabled = true;
+    bool   forceHold = false;
+
+    // revive
+    bool   localDowned = false;
+    double downedAt = 0;
+    double noReviverSince = -1;
+    bool   allowKill = false;
+    double immuneUntil = 0;
+    bool   downed[net::kMaxPlayers]{};
+    int8_t revivingMe = -1;              // slot that is reviving us
+    int    reviveTarget = -1;            // slot we are reviving
+    double reviveStart = 0;
+    float  reviveHpAtStart = 0;
+    float  reviveProgress = 0;           // 0..1, for the name plate
+    int    reviveCandidate = -1;         // nearest downed teammate in reach (name plate prompt)
+
+    // rest
+    uint32_t restSeq = 0;
+    bool     driving = false;            // we are pressing a checkpoint menu for a party rest: not a rest of our own
+    RestJob  rest;
+
+    // trade
+    Trade  trade;
+    std::vector<InvLine> inv;
+    double invAt = 0;
+
+    std::mutex uiMu;
+    UiSnap ui;
+};
+State& S() {
+    static State s;
+    return s;
+}
+
+bool IsFsPlayer(const SDK::UObject* o) {
+    auto& s = S();
+    if (!ue::IsValid(s.playerCls)) s.playerCls = ue::FindClass(kPlayerClass);
+    return o && s.playerCls && o->IsA(s.playerCls);
+}
+SDK::AFS_PlayerChar_C* LocalPlayer() {
+    SDK::ACharacter* ch = ue::LocalCharacter();
+    return ch && ue::IsValid(ch) && IsFsPlayer(ch) ? static_cast<SDK::AFS_PlayerChar_C*>(ch) : nullptr;
+}
+
+template <class P>
+bool Call(SDK::UObject* obj, const char* fn, P& params) {
+    SDK::UFunction* f = obj ? ue::FindFunction(obj, fn) : nullptr;
+    if (!f) {
+        QD_WARN(kTag, "function {} not found on {}", fn, ue::ClassName(obj));
+        return false;
+    }
+    ue::CallFunction(obj, f, &params);
+    return true;
+}
+bool CallNoParams(SDK::UObject* obj, const char* fn) {
+    SDK::UFunction* f = obj ? ue::FindFunction(obj, fn) : nullptr;
+    if (!f) return false;
+    ue::CallFunction(obj, f, nullptr);
+    return true;
+}
+
+std::string NameOf(uint8_t slot) {
+    const auto& m = coop::Members();
+    if (slot < m.size() && m[slot].present && !m[slot].name.empty()) return m[slot].name;
+    return ui::Tr("name.default") + std::to_string(slot + 1);
+}
+
+// ------------------------------------------------------------------ messages
+
+void Send(net::MsgParty m) {
+    auto slot = coop::LocalSlot();
+    if (!slot || !coop::InSession()) return;
+    m.fromSlot = *slot;
+    const auto bytes = net::Encode(m);
+    if (!coop::IsHost()) {
+        coop::Broadcast(net::Channel::Reliable, bytes);   // to the host, who passes it on
+        return;
+    }
+    if (m.toSlot == net::kPartyAll) coop::Broadcast(net::Channel::Reliable, bytes);
+    else if (m.toSlot != *slot) coop::SendToSlot(m.toSlot, net::Channel::Reliable, bytes);
+}
+void SendTo(uint8_t to, net::PartyKind kind, uint32_t id = 0, int32_t arg = 0, int32_t a = 0) {
+    net::MsgParty m;
+    m.kind = kind;
+    m.toSlot = to;
+    m.id = id;
+    m.arg = arg;
+    m.a = a;
+    Send(std::move(m));
+}
+
+// ------------------------------------------------------------------ inventory
+
+SDK::UFS_SaveSlot_C* ActiveSave() {
+    SDK::UWorld* w = ue::World();
+    if (!w || !ue::IsValid(w->OwningGameInstance)) return nullptr;
+    SDK::UGameInstance* gi = w->OwningGameInstance;
+    if (!gi->IsA(SDK::UFS_GameInstanceBase::StaticClass())) return nullptr;
+    auto* base = static_cast<SDK::UFS_GameInstanceBase*>(gi);
+    if (base->bLoadingMap) return nullptr;
+    SDK::UFS_SaveGame* save = base->BaseActiveSave;
+    SDK::UClass* slotCls = SDK::UFS_SaveSlot_C::StaticClass();
+    if (!save || !ue::IsValid(save) || !slotCls || !save->IsA(slotCls)) return nullptr;
+    return static_cast<SDK::UFS_SaveSlot_C*>(save);
+}
+
+// Tradeable: consumables (herbs, potions, throwables...), not weapons, equipment, keys or quest items.
+bool Tradeable(const SDK::UFS_ItemData_C* it) {
+    return it && it->Consumable && !it->Weapon && !it->Equippable && !it->ShowInKeyMenu && !it->Unstackable;
+}
+
+std::vector<InvLine> ReadInventory() {
+    std::vector<InvLine> out;
+    SDK::UFS_SaveSlot_C* save = ActiveSave();
+    if (!save) return out;
+    SDK::UClass* dataCls = SDK::UFS_ItemData_C::StaticClass();
+    for (auto& kv : save->InventoryContents) {   // the live inventory (the Blueprint "Inventory" map is a legacy one)
+        SDK::UFS_Item* raw = kv.Key();
+        const int n = kv.Value();
+        if (!raw || n <= 0 || !ue::IsValid(raw) || !dataCls || !raw->IsA(dataCls)) continue;
+        auto* it = static_cast<SDK::UFS_ItemData_C*>(raw);
+        if (!Tradeable(it)) continue;
+        InvLine l;
+        l.path = ue::PathName(it);
+        try {
+            l.name = it->Name_0.TextData ? it->Name_0.ToString() : ue::Name(it);
+        } catch (...) {
+            l.name = ue::Name(it);
+        }
+        if (l.name.empty()) l.name = ue::Name(it);
+        l.have = n;
+        out.push_back(std::move(l));
+    }
+    std::sort(out.begin(), out.end(), [](const InvLine& a, const InvLine& b) { return a.name < b.name; });
+    return out;
+}
+int CountOf(const std::string& path) {
+    SDK::UFS_SaveSlot_C* save = ActiveSave();
+    if (!save) return 0;
+    for (auto& kv : save->InventoryContents)
+        if (kv.Key() && ue::PathName(kv.Key()) == path) return kv.Value();
+    return 0;
+}
+
+SDK::UObject* SaveFunctions() {
+    SDK::UClass* lib = ue::FindClass(kSaveFunctionsClass);
+    return lib ? lib->ClassDefaultObject : nullptr;
+}
+template <class P>
+void SetSoft(P& p, const std::string& path) {
+    p.Item.WeakPtr.ObjectIndex = 0;
+    p.Item.WeakPtr.ObjectSerialNumber = 0;
+    p.Item.TagAtLastTest = -1;
+    p.Item.ObjectID.AssetPathName = ue::MakeName(path);   // "Package.Object"
+}
+bool GiveItem(const std::string& path, int count) {
+    SDK::ACharacter* ch = ue::LocalCharacter();
+    SDK::UObject* cdo = SaveFunctions();
+    if (!ch || !cdo || count <= 0 || !ue::LoadObject(path)) return false;
+    SDK::Params::SaveFunctions_C_AddItemToInventory p{};
+    SetSoft(p, path);
+    p.Count = count;
+    p.__WorldContext = ch;
+    return Call(cdo, "AddItemToInventory", p);
+}
+bool TakeItem(const std::string& path, int count) {
+    SDK::ACharacter* ch = ue::LocalCharacter();
+    SDK::UObject* cdo = SaveFunctions();
+    if (!ch || !cdo || count <= 0) return false;
+    const int before = CountOf(path);
+    if (before < count) return false;
+    SDK::Params::SaveFunctions_C_TryConsumingItemFromInventory p{};
+    SetSoft(p, path);
+    p.Count = count;
+    p.__WorldContext = ch;
+    if (!Call(cdo, "TryConsumingItemFromInventory", p) || !p.Success) return false;
+    const int after = CountOf(path);
+    if (after > before - count) {   // the game took one per call: take the rest one at a time
+        for (int i = after; i > before - count; --i) {
+            SDK::Params::SaveFunctions_C_TryConsumingItemFromInventory q{};
+            SetSoft(q, path);
+            q.Count = 1;
+            q.__WorldContext = ch;
+            if (!Call(cdo, "TryConsumingItemFromInventory", q) || !q.Success) break;
+        }
+    }
+    return CountOf(path) == before - count;
+}
+
+// ------------------------------------------------------------------ revive
+
+bool TeammateCanRevive() {
+    auto local = coop::LocalSlot();
+    if (!local || !coop::InSession()) return false;
+    for (const auto& m : coop::Members()) {
+        if (!m.present || m.isLocal || m.slot == *local || S().downed[m.slot]) continue;
+        bool dead = false, sameArea = false;
+        if (RemotePlayerInfo(m.slot, dead, sameArea) && !dead && sameArea) return true;
+    }
+    return false;
+}
+
+void SetDowned(bool down) {
+    auto& s = S();
+    if (s.localDowned == down) return;
+    s.localDowned = down;
+    s.downedAt = Now();
+    s.noReviverSince = -1;
+    s.revivingMe = -1;
+    if (auto slot = coop::LocalSlot()) s.downed[*slot] = down;
+    net::MsgParty m;
+    m.kind = net::PartyKind::Downed;
+    m.arg = down ? 1 : 0;
+    if (SDK::ACharacter* ch = ue::LocalCharacter(); ch && ue::IsValid(ch)) m.pos = V(ch->K2_GetActorLocation());
+    Send(std::move(m));
+}
+
+void GoDown(SDK::AFS_PlayerChar_C* p) {
+    QD_INFO(kTag, "down instead of dead (a teammate can revive)");
+    if (p->CharacterMovement && ue::IsValid(p->CharacterMovement)) p->CharacterMovement->StopMovementImmediately();
+    SetDowned(true);
+    ui::Toast(ui::Tr("party.down"), ui::ToastKind::Warning, 8.0f);
+}
+
+// The game's own death, for real (nobody can revive us).
+void DieForReal(const char* why) {
+    auto& s = S();
+    SDK::AFS_PlayerChar_C* p = LocalPlayer();
+    SetDowned(false);
+    if (!p || p->IsDead) return;
+    QD_INFO(kTag, "down -> dead ({})", why);
+    SDK::Params::FS_PlayerChar_C_Kill k{};
+    k.B33smentDeath = false;
+    s.allowKill = true;
+    Call(p, "Kill", k);
+    s.allowKill = false;
+}
+
+void StandUp(uint8_t by) {
+    auto& s = S();
+    SDK::AFS_PlayerChar_C* p = LocalPlayer();
+    if (!s.localDowned || !p) return;
+    SetDowned(false);
+    s.immuneUntil = Now() + kReviveImmuneSec;
+    if (p->Health < 0) p->Health = 0;
+    SDK::Params::FS_PlayerChar_C_HealForPercent h{};
+    h.Percent = kReviveFraction;
+    Call(p, "HealForPercent", h);
+    QD_INFO(kTag, "revived by slot {} (health {:.0f})", by, p->Health);
+    ui::Toast(ui::TrF("party.revived_by", NameOf(by)), ui::ToastKind::Success, 4.0f);
+}
+
+bool OnKillPre(hooks::CallInfo& ci) {
+    auto& s = S();
+    if (s.allowKill) return false;
+    SDK::AFS_PlayerChar_C* p = LocalPlayer();
+    if (!p || ci.object != p) return false;
+    if (s.localDowned) return true;           // already down: stay down
+    if (!s.downEnabled || !TeammateCanRevive()) return false;   // alone: the game's own death
+    GoDown(p);
+    return true;
+}
+
+bool OnPlayerDamagePre(hooks::CallInfo& ci) {
+    auto& s = S();
+    if (!s.localDowned && Now() >= s.immuneUntil) return false;
+    if (ci.object != ue::LocalCharacter()) return false;
+    if (ci.params) static_cast<SDK::Params::FS_PlayerChar_C_TryApplyDamage*>(ci.params)->ReturnValue = false;
+    if (ci.result) *static_cast<bool*>(ci.result) = false;
+    return true;
+}
+
+bool OnBlockedInputPre(hooks::CallInfo& ci) {
+    return S().localDowned && ci.object == ue::LocalCharacter();
+}
+
+bool InteractHeld(SDK::ACharacter* ch) {
+    if (S().forceHold) return true;
+    SDK::UClass* cls = SDK::UFB_InputSubsystem::StaticClass();
+    SDK::UObject* cdo = cls ? cls->ClassDefaultObject : nullptr;
+    if (!cdo) return false;
+    static SDK::UFunction* fn = nullptr;
+    if (!ue::IsValid(fn)) fn = ue::FindFunction(cdo, "IsInputActionKeyDown");
+    if (!fn) return false;
+    SDK::Params::FB_InputSubsystem_IsInputActionKeyDown p{};
+    p.WorldContextObject = ch;
+    p.Action = ue::MakeName("Interact");
+    ue::CallFunction(cdo, fn, &p);
+    return p.ReturnValue;
+}
+
+void StopReviving() {
+    auto& s = S();
+    if (s.reviveTarget >= 0) SendTo(static_cast<uint8_t>(s.reviveTarget), net::PartyKind::Reviving, 0, 0);
+    s.reviveTarget = -1;
+    s.reviveProgress = 0;
+}
+
+void TickRevive(double now) {
+    auto& s = S();
+    SDK::AFS_PlayerChar_C* p = LocalPlayer();
+    if (!coop::InSession()) {
+        if (s.localDowned) DieForReal("session ended");
+        s.reviveTarget = -1;
+        s.reviveCandidate = -1;
+        return;
+    }
+    if (!p) return;
+
+    if (s.localDowned) {
+        if (p->IsDead) {   // the game killed us another way (a pit, a reload)
+            SetDowned(false);
+            return;
+        }
+        if (TeammateCanRevive()) s.noReviverSince = -1;
+        else if (s.noReviverSince < 0) s.noReviverSince = now;
+        else if (now - s.noReviverSince > kBleedOutGraceSec) DieForReal("nobody left to revive");
+        return;
+    }
+
+    // reviver side: the nearest downed teammate in reach
+    s.reviveCandidate = -1;
+    if (p->IsDead) {
+        StopReviving();
+        return;
+    }
+    const SDK::FVector me = p->K2_GetActorLocation();
+    float best = kReviveRangeCm;
+    for (const auto& m : coop::Members()) {
+        if (!m.present || m.isLocal || !s.downed[m.slot]) continue;
+        net::Vec3f feet;
+        float yaw = 0;
+        if (!playersync::RemotePose(m.slot, feet, yaw)) continue;
+        const float dx = feet.x - me.X, dy = feet.y - me.Y;
+        const float d = std::sqrt(dx * dx + dy * dy);
+        if (d <= best && std::fabs(feet.z - me.Z) < kReviveZRangeCm) {
+            best = d;
+            s.reviveCandidate = m.slot;
+        }
+    }
+    const bool held = s.reviveCandidate >= 0 && InteractHeld(p);
+    if (!held || s.reviveCandidate != s.reviveTarget || p->Health < s.reviveHpAtStart - 0.01f) {
+        if (s.reviveTarget >= 0) StopReviving();
+        if (!held) return;
+        s.reviveTarget = s.reviveCandidate;
+        s.reviveStart = now;
+        s.reviveHpAtStart = p->Health;
+        SendTo(static_cast<uint8_t>(s.reviveTarget), net::PartyKind::Reviving, 0, 1);
+        QD_INFO(kTag, "reviving slot {}", s.reviveTarget);
+    }
+    s.reviveHpAtStart = std::min(s.reviveHpAtStart, p->Health);
+    s.reviveProgress = static_cast<float>(std::clamp((now - s.reviveStart) / kReviveSec, 0.0, 1.0));
+    if (s.reviveProgress >= 1.0f) {
+        const uint8_t t = static_cast<uint8_t>(s.reviveTarget);
+        SendTo(t, net::PartyKind::Revive);
+        s.downed[t] = false;   // until their own word arrives
+        s.reviveTarget = -1;
+        s.reviveProgress = 0;
+        QD_INFO(kTag, "revived slot {}", t);
+        ui::Toast(ui::TrF("party.you_revived", NameOf(t)), ui::ToastKind::Success, 3.0f);
+    }
+}
+
+// ------------------------------------------------------------------ party rest
+
+SDK::USaveMenu_C* OpenSaveMenu() {
+    SDK::UClass* cls = ue::FindClass(kSaveMenuClass);
+    if (!cls) return nullptr;
+    auto& objs = SDK::UObject::GObjects;
+    for (int i = 0; i < objs->Num(); ++i) {
+        SDK::UObject* o = objs->GetByIndex(i);
+        if (!o || o->IsDefaultObject() || !o->IsA(cls) || !ue::IsValid(o)) continue;
+        auto* m = static_cast<SDK::USaveMenu_C*>(o);
+        if (m->Removed) continue;
+        SDK::UFunction* fn = ue::FindFunction(m, "IsInViewport");
+        SDK::Params::UserWidget_IsInViewport p{};
+        if (fn) ue::CallFunction(m, fn, &p);
+        if (!fn || p.ReturnValue) return m;
+    }
+    return nullptr;
+}
+
+bool LevelsBusy() {
+    SDK::UObject* cdo = SDK::AFS_LevelManager::GetDefaultObj();
+    SDK::UWorld* world = ue::World();
+    if (!cdo || !world) return false;
+    SDK::UFunction* fn = ue::FindFunction(cdo, "IsProcessingLevelChanges");
+    if (!fn) return false;
+    SDK::Params::FS_LevelManager_IsProcessingLevelChanges p{};
+    p.WorldContextObject = world;
+    ue::CallFunction(cdo, fn, &p);
+    return p.ReturnValue;
+}
+
+// A player pressed Rest or Save in a checkpoint's menu.
+void OnMenuButton(hooks::CallInfo& ci, bool save) {
+    auto& s = S();
+    if (s.driving || !coop::InSession()) return;
+    auto* menu = static_cast<SDK::USaveMenu_C*>(ci.object);
+    if (!menu || !ue::IsValid(menu) || !ue::IsValid(menu->Checkpoint)) return;
+    SDK::Params::Checkpoint_C_GetLocationData ld{};
+    if (!Call(menu->Checkpoint, "GetLocationData", ld) || !ld.ReturnValue) {
+        QD_WARN(kTag, "party {}: the checkpoint has no location data", save ? "save" : "rest");
+        return;
+    }
+    net::MsgParty m;
+    m.kind = net::PartyKind::Rest;
+    m.arg = save ? 1 : 0;
+    m.id = ++s.restSeq;
+    m.text = ue::PathName(ld.ReturnValue);
+    m.pos = V(menu->Checkpoint->K2_GetActorLocation());
+    QD_INFO(kTag, "party {} at {}", save ? "save" : "rest", m.text);
+    Send(std::move(m));
+    ui::Toast(ui::Tr(save ? "party.save_sent" : "party.rest_sent"), ui::ToastKind::Info, 3.0f);
+}
+
+void RestFail(const char* key) {
+    auto& s = S();
+    QD_WARN(kTag, "party rest from slot {} not followed: {}", s.rest.from, key);
+    ui::Toast(ui::TrF(key, NameOf(s.rest.from)), ui::ToastKind::Warning, 5.0f);
+    s.rest.step = RestStep::Idle;
+    s.driving = false;
+}
+
+void StartRest(const net::MsgParty& m) {
+    auto& s = S();
+    SDK::AFS_PlayerChar_C* p = LocalPlayer();
+    s.rest = RestJob{};
+    s.rest.from = m.fromSlot;
+    s.rest.save = m.arg == 1;
+    s.rest.locPath = m.text;
+    s.rest.pos = V(m.pos);
+    if (!p || p->IsDead) return RestFail("party.rest_missed_dead");
+    if (p->CurrentCutsceneManager || p->InIntroCutscene) return RestFail("party.rest_missed_busy");
+    if (p->Resting || OpenSaveMenu()) return RestFail("party.rest_missed_busy");
+    if (s.localDowned) {   // a rest stands a downed player up
+        SetDowned(false);
+        if (p->Health < 0) p->Health = 0;
+        SDK::Params::FS_PlayerChar_C_HealForPercent h{};
+        h.Percent = kReviveFraction;
+        Call(p, "HealForPercent", h);
+    }
+    if (s.trade.stage != TradeStage::None) {
+        SendTo(s.trade.peer, net::PartyKind::TradeCancel, s.trade.id);
+        s.trade = Trade{};
+    }
+    ui::Toast(ui::TrF(s.rest.save ? "party.save_follow" : "party.rest_follow", NameOf(m.fromSlot)), ui::ToastKind::Info, 4.0f);
+    s.rest.stepAt = Now();
+    if (Dist(p->K2_GetActorLocation(), s.rest.pos) <= kRestNearCm) {
+        s.rest.step = RestStep::FindCheckpoint;
+        return;
+    }
+    auto* loc = static_cast<SDK::UFS_LocationData*>(ue::LoadObject(s.rest.locPath));
+    if (!loc) return RestFail("party.rest_missed_far");
+    SDK::Params::FS_PlayerChar_C_TeleportToLocation t{};
+    t.Location_Data = loc;
+    t.GreenFX = false;
+    if (!Call(p, "TeleportToLocation", t)) return RestFail("party.rest_missed_far");
+    QD_INFO(kTag, "party rest: travelling to {}", s.rest.locPath);
+    s.rest.step = RestStep::Travel;
+}
+
+SDK::ACheckpoint_C* NearestCheckpoint(const SDK::FVector& at, float maxCm) {
+    SDK::UClass* cls = ue::FindClass(kCheckpointClass);
+    if (!cls) return nullptr;
+    std::vector<SDK::AActor*> all;
+    ActorsOfClass(cls, all);
+    SDK::ACheckpoint_C* best = nullptr;
+    float bestD = maxCm;
+    for (SDK::AActor* a : all) {
+        if (!a || !ue::IsValid(a)) continue;
+        const float d = Dist(a->K2_GetActorLocation(), at);
+        if (d < bestD) {
+            bestD = d;
+            best = static_cast<SDK::ACheckpoint_C*>(a);
+        }
+    }
+    return best;
+}
+
+void TickRest(double now) {
+    auto& s = S();
+    RestJob& r = s.rest;
+    if (r.step == RestStep::Idle) return;
+    SDK::AFS_PlayerChar_C* p = LocalPlayer();
+    if (!p) {
+        if (now - r.stepAt > kRestTravelMaxSec) RestFail("party.rest_missed_far");
+        return;   // a level load during the travel: wait for the character
+    }
+    const double inStep = now - r.stepAt;
+    auto next = [&](RestStep st) {
+        r.step = st;
+        r.stepAt = now;
+    };
+    switch (r.step) {
+        case RestStep::Travel:
+            if (inStep < 1.5 || p->Teleporting || p->QuickTeleporting || LevelsBusy()) {
+                if (inStep > kRestTravelMaxSec) RestFail("party.rest_missed_far");
+                return;
+            }
+            next(RestStep::FindCheckpoint);
+            return;
+        case RestStep::FindCheckpoint: {
+            r.checkpoint = NearestCheckpoint(r.pos, 2500.0f);
+            if (!r.checkpoint) {
+                if (inStep > 10.0) RestFail("party.rest_missed_far");
+                return;
+            }
+            const SDK::FVector cp = r.checkpoint->K2_GetActorLocation();
+            if (Dist(p->K2_GetActorLocation(), cp) > 400.0f) {
+                const float half = p->CapsuleComponent ? p->CapsuleComponent->GetScaledCapsuleHalfHeight() : 90.0f;
+                const SDK::FVector dest(cp.X + 180.0f, cp.Y, cp.Z + half + 20.0f);
+                p->K2_TeleportTo(dest, p->K2_GetActorRotation());
+            }
+            next(RestStep::OpenMenu);
+            return;
+        }
+        case RestStep::OpenMenu:
+            if (inStep < 0.3) return;
+            if (!ue::IsValid(r.checkpoint)) return RestFail("party.rest_missed_far");
+            if (!OpenSaveMenu()) {
+                s.driving = true;
+                SDK::Params::Checkpoint_C_Interact in{};
+                in.PlayerInteracting = p;
+                Call(r.checkpoint, "Interact", in);
+            }
+            next(RestStep::Press);
+            return;
+        case RestStep::Press: {
+            SDK::USaveMenu_C* menu = OpenSaveMenu();
+            if (!menu) {
+                if (inStep > kRestMenuMaxSec) RestFail("party.rest_missed_busy");
+                return;
+            }
+            if (inStep < 0.6) return;   // let the menu finish opening
+            struct { SDK::UCommonButtonBase* Button = nullptr; } btn;
+            s.driving = true;
+            Call(menu, r.save ? kSaveButtonName : kRestButtonName, btn);
+            r.sawResting = false;
+            next(RestStep::WaitDone);
+            return;
+        }
+        case RestStep::WaitDone: {
+            if (p->Resting) r.sawResting = true;
+            SDK::USaveMenu_C* menu = OpenSaveMenu();
+            bool done;
+            if (r.save) done = inStep > 1.5 && menu && !menu->Saving;
+            else done = inStep > 2.0 && !p->Resting && (r.sawResting || inStep > 6.0) && menu;
+            if (!done && inStep < kRestRunMaxSec) return;
+            next(RestStep::Close);
+            return;
+        }
+        case RestStep::Close: {
+            if (inStep < 0.4) return;
+            if (SDK::USaveMenu_C* menu = OpenSaveMenu()) CallNoParams(menu, "Close");
+            QD_INFO(kTag, "party {} done", r.save ? "save" : "rest");
+            ui::Toast(ui::Tr(r.save ? "party.save_done" : "party.rest_done"), ui::ToastKind::Success, 3.0f);
+            r.step = RestStep::Idle;
+            s.driving = false;
+            return;
+        }
+        default:
+            r.step = RestStep::Idle;
+            s.driving = false;
+            return;
+    }
+}
+
+// ------------------------------------------------------------------ trading
+
+bool TeammateNear(uint8_t slot, float cm) {
+    SDK::ACharacter* ch = ue::LocalCharacter();
+    net::Vec3f feet;
+    float yaw = 0;
+    if (!ch || !ue::IsValid(ch) || !playersync::RemotePose(slot, feet, yaw)) return false;
+    bool dead = false, sameArea = false;
+    if (!RemotePlayerInfo(slot, dead, sameArea) || dead || !sameArea) return false;
+    return Dist(ch->K2_GetActorLocation(), V(feet)) <= cm;
+}
+
+void TradeReset(const char* toastKey = nullptr, ui::ToastKind kind = ui::ToastKind::Info) {
+    auto& s = S();
+    if (toastKey && s.trade.peer < net::kMaxPlayers) ui::Toast(ui::TrF(toastKey, NameOf(s.trade.peer)), kind, 4.0f);
+    s.trade = Trade{};
+}
+
+void SendOffer() {
+    auto& s = S();
+    net::MsgParty m;
+    m.kind = net::PartyKind::TradeOffer;
+    m.toSlot = s.trade.peer;
+    m.id = s.trade.id;
+    m.a = s.trade.myVersion;
+    for (const auto& [path, n] : s.trade.mine)
+        if (n > 0) m.items.push_back({path, n});
+    Send(std::move(m));
+}
+
+// Game thread, from the menu.
+void TradeRequest(uint8_t peer) {
+    auto& s = S();
+    if (s.trade.stage != TradeStage::None) return;
+    if (s.localDowned || S().downed[peer]) return ui::Toast(ui::Tr("trade.not_down"), ui::ToastKind::Warning);
+    if (!TeammateNear(peer, kTradeRangeCm)) return ui::Toast(ui::Tr("trade.too_far"), ui::ToastKind::Warning);
+    static std::mt19937 rng{std::random_device{}()};
+    s.trade = Trade{};
+    s.trade.stage = TradeStage::Outgoing;
+    s.trade.id = rng() | 1u;
+    s.trade.peer = peer;
+    s.trade.requester = true;
+    s.trade.openedAt = Now();
+    SendTo(peer, net::PartyKind::TradeRequest, s.trade.id);
+    ui::Toast(ui::TrF("trade.requested", NameOf(peer)), ui::ToastKind::Info);
+}
+void TradeAnswer(bool accept) {
+    auto& s = S();
+    if (s.trade.stage != TradeStage::Incoming) return;
+    if (!accept) {
+        SendTo(s.trade.peer, net::PartyKind::TradeDecline, s.trade.id);
+        return TradeReset();
+    }
+    if (!TeammateNear(s.trade.peer, kTradeRangeCm)) {
+        SendTo(s.trade.peer, net::PartyKind::TradeDecline, s.trade.id);
+        ui::Toast(ui::Tr("trade.too_far"), ui::ToastKind::Warning);
+        return TradeReset();
+    }
+    s.trade.stage = TradeStage::Open;
+    SendTo(s.trade.peer, net::PartyKind::TradeAccept, s.trade.id);
+}
+void TradeCancel() {
+    auto& s = S();
+    if (s.trade.stage == TradeStage::None || s.trade.committing) return;
+    SendTo(s.trade.peer, net::PartyKind::TradeCancel, s.trade.id);
+    TradeReset("trade.cancelled_by_you");
+}
+void TradeSetCount(const std::string& path, int count) {
+    auto& s = S();
+    if (s.trade.stage != TradeStage::Open || s.trade.committing) return;
+    count = std::clamp(count, 0, CountOf(path));
+    int& cur = s.trade.mine[path];
+    if (cur == count) return;
+    cur = count;
+    ++s.trade.myVersion;
+    s.trade.myConfirm = s.trade.theirConfirm = false;
+    SendOffer();
+}
+void TradeConfirm(bool yes) {
+    auto& s = S();
+    if (s.trade.stage != TradeStage::Open || s.trade.committing) return;
+    s.trade.myConfirm = yes;
+    SendTo(s.trade.peer, net::PartyKind::TradeConfirm, s.trade.id, yes ? 1 : 0, s.trade.theirVersion);
+}
+
+bool OfferAvailable() {
+    for (const auto& [path, n] : S().trade.mine)
+        if (n > 0 && CountOf(path) < n) return false;
+    return true;
+}
+bool HandOver(const std::vector<OfferLine>& get) {
+    auto& s = S();
+    for (const auto& [path, n] : s.trade.mine)
+        if (n > 0 && !TakeItem(path, n)) {
+            QD_WARN(kTag, "trade: could not take {} x{}", path, n);
+            return false;
+        }
+    for (const auto& l : get)
+        if (!GiveItem(l.path, l.count)) QD_WARN(kTag, "trade: could not add {} x{}", l.path, l.count);
+    return true;
+}
+
+void TickTrade(double) {
+    auto& s = S();
+    Trade& t = s.trade;
+    if (t.stage == TradeStage::None) return;
+    const auto& mem = coop::Members();
+    if (!coop::InSession() || t.peer >= mem.size() || !mem[t.peer].present) return TradeReset("trade.peer_left");
+    if (t.stage == TradeStage::Open && !t.committing && !TeammateNear(t.peer, kTradeBreakCm)) {
+        SendTo(t.peer, net::PartyKind::TradeCancel, t.id);
+        return TradeReset("trade.too_far_cancel", ui::ToastKind::Warning);
+    }
+    if (t.stage == TradeStage::Outgoing && Now() - t.openedAt > 60.0) {
+        SendTo(t.peer, net::PartyKind::TradeCancel, t.id);
+        return TradeReset("trade.no_answer");
+    }
+    // requester: both confirmed the current offers -> commit
+    if (t.stage == TradeStage::Open && t.requester && !t.committing && t.myConfirm && t.theirConfirm) {
+        if (!OfferAvailable()) {
+            t.myConfirm = false;
+            TradeConfirm(false);
+            ui::Toast(ui::Tr("trade.missing_items"), ui::ToastKind::Warning);
+            return;
+        }
+        net::MsgParty m;
+        m.kind = net::PartyKind::TradeCommit;
+        m.toSlot = t.peer;
+        m.id = t.id;
+        m.a = t.theirVersion;
+        for (const auto& [path, n] : t.mine)
+            if (n > 0) m.items.push_back({path, n});
+        t.committing = true;
+        Send(std::move(m));
+    }
+}
+
+void OnTradeMsg(const net::MsgParty& m) {
+    auto& s = S();
+    Trade& t = s.trade;
+    using K = net::PartyKind;
+    if (m.kind == K::TradeRequest) {
+        if (t.stage != TradeStage::None || s.localDowned) {
+            SendTo(m.fromSlot, K::TradeDecline, m.id, 1);
+            return;
+        }
+        t = Trade{};
+        t.stage = TradeStage::Incoming;
+        t.id = m.id;
+        t.peer = m.fromSlot;
+        t.openedAt = Now();
+        ui::Toast(ui::TrF("trade.incoming", NameOf(m.fromSlot)), ui::ToastKind::Info, 8.0f);
+        return;
+    }
+    if (t.stage == TradeStage::None || m.id != t.id || m.fromSlot != t.peer) return;
+    switch (m.kind) {
+        case K::TradeAccept:
+            if (t.stage == TradeStage::Outgoing) t.stage = TradeStage::Open;
+            return;
+        case K::TradeDecline:
+            return TradeReset(m.arg == 1 ? "trade.busy" : "trade.declined");
+        case K::TradeCancel:
+            return TradeReset("trade.cancelled");
+        case K::TradeOffer:
+            t.theirs.clear();
+            for (const auto& it : m.items) {
+                OfferLine l{it.path, it.path, it.count};
+                if (SDK::UObject* o = ue::LoadObject(it.path)) {
+                    auto* d = static_cast<SDK::UFS_ItemData_C*>(o);
+                    if (d->Name_0.TextData) l.name = d->Name_0.ToString();
+                }
+                t.theirs.push_back(std::move(l));
+            }
+            t.theirVersion = m.a;
+            t.myConfirm = t.theirConfirm = false;
+            return;
+        case K::TradeConfirm:
+            if (m.a == t.myVersion) t.theirConfirm = m.arg == 1;
+            return;
+        case K::TradeCommit: {   // we are not the requester: hand over now
+            std::vector<OfferLine> get;
+            for (const auto& it : m.items) get.push_back({it.path, it.path, it.count});
+            const bool ok = !t.requester && m.a == t.myVersion && t.myConfirm && OfferAvailable() && HandOver(get);
+            SendTo(t.peer, K::TradeDone, t.id, ok ? 1 : 0);
+            if (ok) return TradeReset("trade.done", ui::ToastKind::Success);
+            t.myConfirm = t.theirConfirm = false;
+            ui::Toast(ui::Tr("trade.failed"), ui::ToastKind::Warning);
+            return;
+        }
+        case K::TradeDone:
+            if (!t.committing) return;
+            t.committing = false;
+            if (m.arg == 1) {
+                HandOver(t.theirs);
+                return TradeReset("trade.done", ui::ToastKind::Success);
+            }
+            t.myConfirm = t.theirConfirm = false;
+            ui::Toast(ui::Tr("trade.failed"), ui::ToastKind::Warning);
+            return;
+        default:
+            return;
+    }
+}
+
+// ------------------------------------------------------------------ message handler
+
+void OnParty(uint8_t dispatchSlot, const uint8_t* data, size_t size) {
+    net::MsgParty m;
+    if (!net::Decode(data, size, m)) return;
+    auto local = coop::LocalSlot();
+    if (!local) return;
+    if (coop::IsHost()) {
+        if (dispatchSlot >= net::kMaxPlayers || dispatchSlot == *local) return;
+        m.fromSlot = dispatchSlot;   // never trust the slot a client claims
+        const auto bytes = net::Encode(m);
+        for (const auto& mem : coop::Members()) {
+            if (!mem.present || mem.isLocal || mem.slot == dispatchSlot) continue;
+            if (m.toSlot == net::kPartyAll || m.toSlot == mem.slot) coop::SendToSlot(mem.slot, net::Channel::Reliable, bytes);
+        }
+        if (m.toSlot != net::kPartyAll && m.toSlot != *local) return;
+    } else if (m.toSlot != net::kPartyAll && m.toSlot != *local) {
+        return;
+    }
+    if (m.fromSlot == *local) return;
+
+    auto& s = S();
+    switch (m.kind) {
+        case net::PartyKind::Downed:
+            s.downed[m.fromSlot] = m.arg == 1;
+            if (m.arg == 1) ui::Toast(ui::TrF("party.mate_down", NameOf(m.fromSlot)), ui::ToastKind::Warning, 5.0f);
+            if (m.arg == 0 && s.reviveTarget == m.fromSlot) StopReviving();
+            return;
+        case net::PartyKind::Reviving:
+            if (!s.localDowned) return;
+            if (m.arg == 1) {
+                s.revivingMe = static_cast<int8_t>(m.fromSlot);
+                ui::Toast(ui::TrF("party.being_revived", NameOf(m.fromSlot)), ui::ToastKind::Info, 3.0f);
+            } else if (s.revivingMe == m.fromSlot) {
+                s.revivingMe = -1;
+            }
+            return;
+        case net::PartyKind::Revive:
+            StandUp(m.fromSlot);
+            return;
+        case net::PartyKind::Rest:
+            if (s.rest.step != RestStep::Idle) return;   // one at a time
+            StartRest(m);
+            return;
+        default:
+            OnTradeMsg(m);
+            return;
+    }
+}
+
+void OnMember(const coop::Member& m, bool joined) {
+    auto& s = S();
+    if (m.slot < net::kMaxPlayers) s.downed[m.slot] = false;
+    if (joined && s.localDowned) {   // tell the newcomer we are down
+        net::MsgParty d;
+        d.kind = net::PartyKind::Downed;
+        d.arg = 1;
+        d.toSlot = coop::IsHost() ? m.slot : net::kPartyAll;
+        Send(std::move(d));
+    }
+    if (!joined && s.reviveTarget == m.slot) s.reviveTarget = -1;
+}
+
+// ------------------------------------------------------------------ tick + UI
+
+void Tick(float) {
+    auto& s = S();
+    const double now = Now();
+    TickRevive(now);
+    TickRest(now);
+    TickTrade(now);
+
+    if (now - s.invAt > 0.5) {
+        s.invAt = now;
+        s.inv = (ue::IsValid(ue::LocalCharacter()) && coop::InSession()) ? ReadInventory() : std::vector<InvLine>{};
+    }
+    UiSnap snap;
+    snap.inSession = coop::InSession();
+    snap.inGame = LocalPlayer() != nullptr;
+    snap.localDowned = s.localDowned;
+    for (const auto& m : coop::Members()) {
+        if (!m.present || m.isLocal) continue;
+        snap.mates.push_back({m.slot, NameOf(m.slot), s.downed[m.slot], snap.inGame && TeammateNear(m.slot, kTradeRangeCm)});
+    }
+    snap.trade = s.trade;
+    if (s.trade.peer < net::kMaxPlayers) snap.peerName = NameOf(s.trade.peer);
+    snap.inv = s.inv;
+    std::lock_guard lk(s.uiMu);
+    s.ui = std::move(snap);
+}
+
+const ImVec4 kColOk(0.55f, 0.86f, 0.62f, 1.0f);
+const ImVec4 kColWarn(0.96f, 0.77f, 0.38f, 1.0f);
+
+void DrawTab() {
+    UiSnap s;
+    {
+        std::lock_guard lk(S().uiMu);
+        s = S().ui;
+    }
+    using ui::Tr;
+    if (!s.inSession) {
+        ImGui::TextWrapped("%s", Tr("party.not_in_session"));
+        return;
+    }
+    ImGui::TextWrapped("%s", Tr("party.help"));
+    ImGui::Separator();
+
+    const Trade& t = s.trade;
+    if (t.stage == TradeStage::None) {
+        ImGui::TextUnformatted(Tr("party.mates"));
+        for (const auto& m : s.mates) {
+            ImGui::PushID(m.slot);
+            ImGui::Text("%s", m.name.c_str());
+            if (m.downed) {
+                ImGui::SameLine();
+                ImGui::TextColored(kColWarn, "%s", Tr("party.state_down"));
+            }
+            ImGui::SameLine();
+            ImGui::BeginDisabled(!m.near || m.downed || s.localDowned);
+            if (ImGui::Button(Tr("trade.button"))) {
+                const uint8_t slot = m.slot;
+                gamethread::Post([slot] { TradeRequest(slot); });
+            }
+            ImGui::EndDisabled();
+            if (!m.near) {
+                ImGui::SameLine();
+                ImGui::TextDisabled("%s", Tr("trade.come_closer"));
+            }
+            ImGui::PopID();
+        }
+        if (s.mates.empty()) ImGui::TextDisabled("%s", Tr("party.no_mates"));
+        return;
+    }
+
+    const std::string& peer = s.peerName;
+    if (t.stage == TradeStage::Outgoing) {
+        ImGui::TextWrapped("%s", ui::TrF("trade.waiting", peer).c_str());
+        if (ImGui::Button(Tr("trade.cancel"))) gamethread::Post([] { TradeCancel(); });
+        return;
+    }
+    if (t.stage == TradeStage::Incoming) {
+        ImGui::TextWrapped("%s", ui::TrF("trade.incoming", peer).c_str());
+        if (ImGui::Button(Tr("trade.accept"))) gamethread::Post([] { TradeAnswer(true); });
+        ImGui::SameLine();
+        if (ImGui::Button(Tr("trade.decline"))) gamethread::Post([] { TradeAnswer(false); });
+        return;
+    }
+
+    // open trade: my offer (left), theirs (right)
+    ImGui::TextUnformatted(ui::TrF("trade.with", peer).c_str());
+    if (ImGui::BeginTable("trade", 2, ImGuiTableFlags_BordersInnerV)) {
+        ImGui::TableNextColumn();
+        ImGui::TextUnformatted(Tr("trade.your_offer"));
+        if (s.inv.empty()) ImGui::TextDisabled("%s", Tr("trade.nothing"));
+        for (const auto& l : s.inv) {
+            ImGui::PushID(l.path.c_str());
+            auto it = t.mine.find(l.path);
+            const int cur = it == t.mine.end() ? 0 : it->second;
+            ImGui::BeginDisabled(t.committing);
+            if (ImGui::SmallButton("-")) {
+                const std::string path = l.path;
+                gamethread::Post([path, cur] { TradeSetCount(path, cur - 1); });
+            }
+            ImGui::SameLine();
+            if (ImGui::SmallButton("+")) {
+                const std::string path = l.path;
+                gamethread::Post([path, cur] { TradeSetCount(path, cur + 1); });
+            }
+            ImGui::EndDisabled();
+            ImGui::SameLine();
+            if (cur > 0) ImGui::TextColored(kColOk, "%d / %d  %s", cur, l.have, l.name.c_str());
+            else ImGui::Text("0 / %d  %s", l.have, l.name.c_str());
+            ImGui::PopID();
+        }
+        ImGui::TableNextColumn();
+        ImGui::TextUnformatted(ui::TrF("trade.their_offer", peer).c_str());
+        if (t.theirs.empty()) ImGui::TextDisabled("%s", Tr("trade.nothing"));
+        for (const auto& l : t.theirs) ImGui::Text("%d  %s", l.count, l.name.c_str());
+        ImGui::EndTable();
+    }
+    ImGui::Separator();
+    ImGui::Text("%s %s   %s %s", Tr("trade.you"), t.myConfirm ? Tr("trade.confirmed") : Tr("trade.not_confirmed"),
+                peer.c_str(), t.theirConfirm ? Tr("trade.confirmed") : Tr("trade.not_confirmed"));
+    ImGui::BeginDisabled(t.committing);
+    if (!t.myConfirm) {
+        if (ImGui::Button(Tr("trade.confirm"))) gamethread::Post([] { TradeConfirm(true); });
+    } else if (ImGui::Button(Tr("trade.unconfirm"))) {
+        gamethread::Post([] { TradeConfirm(false); });
+    }
+    ImGui::SameLine();
+    if (ImGui::Button(Tr("trade.cancel"))) gamethread::Post([] { TradeCancel(); });
+    ImGui::EndDisabled();
+}
+
+}  // namespace
+
+bool PartyLocalDowned() { return S().localDowned; }
+bool PartySlotDowned(uint8_t slot) { return slot < net::kMaxPlayers && S().downed[slot]; }
+
+std::string PartyLabelSuffix(uint8_t slot) {
+    auto& s = S();
+    if (slot >= net::kMaxPlayers || !s.downed[slot]) return {};
+    if (s.reviveTarget == slot) return ui::TrF("party.label_reviving", static_cast<int>(s.reviveProgress * 100.0f));
+    if (s.reviveCandidate == slot && !s.localDowned) return ui::Tr("party.label_hold");
+    return ui::Tr("party.label_down");
+}
+
+#if QD_DEV
+void PartyDebug(const std::string& args) {
+    auto& s = S();
+    std::istringstream in(args);
+    std::string cmd, sub;
+    in >> cmd;
+    if (cmd == "down") { int v = 1; in >> v; s.downEnabled = v != 0; }
+    else if (cmd == "hold") { int v = 1; in >> v; s.forceHold = v != 0; }
+    else if (cmd == "trade") {
+        in >> sub;
+        if (sub == "req") { int sl = 1; in >> sl; TradeRequest(static_cast<uint8_t>(sl)); }
+        else if (sub == "accept") TradeAnswer(true);
+        else if (sub == "decline") TradeAnswer(false);
+        else if (sub == "offer") { std::string path; int n = 1; in >> path >> n; TradeSetCount(path, n); }
+        else if (sub == "confirm") { int v = 1; in >> v; TradeConfirm(v != 0); }
+        else if (sub == "cancel") TradeCancel();
+    }
+    std::string downed;
+    for (int i = 0; i < net::kMaxPlayers; ++i) downed += (i ? "," : "") + std::string(s.downed[i] ? "true" : "false");
+    std::string inv;
+    for (const auto& l : ReadInventory()) {
+        std::string esc;
+        for (char c : l.path) esc += (c == '"' || c == 0x5C) ? '_' : c;
+        inv += (inv.empty() ? "" : ",") + std::format("\"{}\":{}", esc, l.have);
+    }
+    SDK::AFS_PlayerChar_C* p = LocalPlayer();
+    QD_INFO(kTag, "party state {{\"downEnabled\":{},\"localDowned\":{},\"downed\":[{}],\"reviveTarget\":{},"
+                  "\"reviveCandidate\":{},\"progress\":{:.2f},\"rest\":{},\"driving\":{},\"trade\":{},"
+                  "\"tradePeer\":{},\"myConfirm\":{},\"theirConfirm\":{},\"theirs\":{},\"health\":{:.1f},"
+                  "\"dead\":{},\"inv\":{{{}}}}}",
+            s.downEnabled, s.localDowned, downed, s.reviveTarget, s.reviveCandidate, s.reviveProgress,
+            static_cast<int>(s.rest.step), s.driving, static_cast<int>(s.trade.stage), static_cast<int>(s.trade.peer),
+            s.trade.myConfirm, s.trade.theirConfirm, s.trade.theirs.size(), p ? p->Health : -1.0f,
+            p ? p->IsDead : false, inv);
+}
+#endif
+
+void PartyInit() {
+    auto& s = S();
+    if (s.inited) return;
+    s.inited = true;
+    coop::On(net::MsgType::Party, OnParty);
+    coop::AddMemberListener(OnMember);
+    s.hooks.push_back(hooks::AddPre(kFnKill, OnKillPre));
+    s.hooks.push_back(hooks::AddPre(kFnPlayerDamage, OnPlayerDamagePre));
+    for (const char* fn : kBlockedWhileDown)
+        s.hooks.push_back(hooks::AddPre((std::string(kPlayerClass) + ":" + fn).c_str(), OnBlockedInputPre));
+    s.hooks.push_back(hooks::AddPost(kFnRestButton, [](hooks::CallInfo& ci) { OnMenuButton(ci, false); }));
+    s.hooks.push_back(hooks::AddPost(kFnSaveButton, [](hooks::CallInfo& ci) { OnMenuButton(ci, true); }));
+    s.ticker = gamethread::AddTicker("party", Tick);
+    ui::AddMenuTab("party", "tab.party", DrawTab, 20);
+    QD_INFO(kTag, "party features ready (revive, party rest, trading)");
+}
+
+void PartyShutdown() {
+    auto& s = S();
+    if (!s.inited) return;
+    for (auto id : s.hooks) hooks::Remove(id);
+    s.hooks.clear();
+    if (s.ticker) gamethread::RemoveTicker(s.ticker);
+    s.ticker = 0;
+    s.inited = false;
+}
+
+}  // namespace qd::sync

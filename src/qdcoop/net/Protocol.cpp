@@ -516,4 +516,45 @@ bool Decode(const uint8_t* data, size_t size, MsgCall& out) {
     });
 }
 
+std::vector<uint8_t> Encode(const MsgParty& m) {
+    ByteWriter w = Begin(MsgType::Party, 40 + m.text.size() + m.items.size() * 64);
+    w.U8(static_cast<uint8_t>(m.kind));
+    w.U8(m.fromSlot);
+    w.U8(m.toSlot);
+    w.U32(m.id);
+    w.U32(static_cast<uint32_t>(m.arg));
+    w.U32(static_cast<uint32_t>(m.a));
+    WriteVec(w, m.pos);
+    w.Str(m.text.size() <= kMaxPartyText ? m.text : std::string());
+    const size_t n = m.items.size() <= kMaxPartyItems ? m.items.size() : 0;
+    w.U8(static_cast<uint8_t>(n));
+    for (size_t i = 0; i < n; ++i) {
+        w.Str(m.items[i].path.size() <= kMaxItemPathBytes ? m.items[i].path : std::string());
+        w.U32(static_cast<uint32_t>(m.items[i].count));
+    }
+    return w.Take();
+}
+bool Decode(const uint8_t* data, size_t size, MsgParty& out) {
+    return DecodeInto(data, size, MsgType::Party, out, [](ByteReader& r, MsgParty& m) {
+        uint8_t kind = 0, n = 0;
+        uint32_t arg = 0, a = 0;
+        if (!(r.U8(kind) && ((kind >= 1 && kind <= 4) || (kind >= 10 && kind <= 17)) && r.U8(m.fromSlot) &&
+              m.fromSlot < kMaxPlayers && r.U8(m.toSlot) && (m.toSlot < kMaxPlayers || m.toSlot == kPartyAll) &&
+              r.U32(m.id) && r.U32(arg) && r.U32(a) && ReadVec(r, m.pos) && r.Str(m.text) &&
+              m.text.size() <= kMaxPartyText && r.U8(n) && n <= kMaxPartyItems))
+            return false;
+        m.kind = static_cast<PartyKind>(kind);
+        m.arg = static_cast<int32_t>(arg);
+        m.a = static_cast<int32_t>(a);
+        m.items.resize(n);
+        for (auto& it : m.items) {
+            uint32_t c = 0;
+            if (!(r.Str(it.path) && it.path.size() <= kMaxItemPathBytes && r.U32(c))) return false;
+            it.count = static_cast<int32_t>(c);
+            if (it.count < 0 || it.count > 9999) return false;
+        }
+        return true;
+    });
+}
+
 }  // namespace qd::net

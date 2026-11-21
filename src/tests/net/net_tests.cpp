@@ -311,7 +311,7 @@ void TestRoundTrips() {
     notify.flags = kDamageHitNotifyOnly;
     RoundTrip("DamageRequest(notify)", notify, MsgType::DamageRequest);
 
-    CHECK(kProtocolVersion == 7);   // v7: Call; v6: WorldFlags in use, Hazard
+    CHECK(kProtocolVersion == 8);   // v8: Party; v7: Call; v6: WorldFlags in use, Hazard
     CHECK(static_cast<uint8_t>(MsgType::EnemyOwner) == 45);
     MsgEnemyOwner eo;
     eo.enemyId = 0x0123456789ABCDEFull;
@@ -394,6 +394,36 @@ void TestRoundTrips() {
         ca.target = 7;
         const auto bad = Encode(ca);
         CHECK(!Decode(bad.data(), bad.size(), cback));
+
+        MsgParty pa;
+        pa.kind = PartyKind::TradeOffer;
+        pa.fromSlot = 2;
+        pa.toSlot = 1;
+        pa.id = 77;
+        pa.arg = -3;
+        pa.a = 5;
+        pa.pos = {1, 2, 3};
+        pa.text = "/Game/Items/Consumables/Herb.Herb";
+        pa.items = {{"/Game/Items/Consumables/Herb.Herb", 3}, {"/Game/Items/Consumables/Potion.Potion", 1}};
+        const auto pb = Encode(pa);
+        MsgParty pback;
+        CHECK(PeekType(pb.data(), pb.size()) == MsgType::Party);
+        CHECK(Decode(pb.data(), pb.size(), pback));
+        CHECK(pback.kind == PartyKind::TradeOffer && pback.fromSlot == 2 && pback.toSlot == 1 && pback.id == 77);
+        CHECK(pback.arg == -3 && pback.a == 5 && pback.pos.z == 3 && pback.text == pa.text);
+        CHECK(pback.items.size() == 2 && pback.items[1].count == 1 && pback.items[0].path == pa.items[0].path);
+        CHECK(!Decode(pb.data(), pb.size() - 1, pback));
+        pa.toSlot = kPartyAll;
+        pa.items.clear();
+        const auto pall = Encode(pa);
+        CHECK(Decode(pall.data(), pall.size(), pback) && pback.toSlot == kPartyAll && pback.items.empty());
+        pa.toSlot = 9;
+        const auto pbad = Encode(pa);
+        CHECK(!Decode(pbad.data(), pbad.size(), pback));
+        pa.toSlot = 1;
+        pa.kind = static_cast<PartyKind>(9);
+        const auto pbad2 = Encode(pa);
+        CHECK(!Decode(pbad2.data(), pbad2.size(), pback));
     }
 
     // Range checks.

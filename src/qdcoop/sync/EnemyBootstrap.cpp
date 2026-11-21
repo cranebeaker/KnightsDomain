@@ -7,6 +7,7 @@
 #include "qdcoop/sync/BossSync.h"
 #include "qdcoop/sync/EnemySync.h"
 #include "qdcoop/sync/HazardSync.h"
+#include "qdcoop/sync/Party.h"
 #include "qdcoop/sync/Rules.h"
 #include "qdcoop/sync/Summon.h"
 #include "qdcoop/sync/WorldSync.h"
@@ -21,6 +22,7 @@ void StartWo4Modules() {
     WorldSyncInit();
     HazardSyncInit();
     BossSyncInit();
+    PartyInit();
     QD_INFO("bootstrap", "enemy modules ready (rules, enemy sync, summon)");
 }
 

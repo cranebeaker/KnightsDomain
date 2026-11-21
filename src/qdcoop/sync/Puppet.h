@@ -62,6 +62,7 @@ public:
     bool Spawn(const net::Vec3f& feet, float yaw);   // loads + caches assets on first use (may hitch once)
     void Destroy();                                  // K2_DestroyActor if the actor is still alive in the current world
     void Abandon();                                  // world changed: drop pointers without touching them
+    void Forget();                                   // drop every pointer, never touch the engine (crash recovery)
     bool IsSpawned() const;
 
     void SetTransform(const net::Vec3f& feet, float yaw);

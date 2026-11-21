@@ -523,12 +523,21 @@ void Puppet::Destroy() {
 }
 
 void Puppet::Abandon() {
-    // If the old actors are still alive (e.g. we only *thought* the world changed), destroy them instead of leaking them.
-    DestroyWeaponActor();
-    if (actor_ && ue::IsValid(actor_)) {
-        actor_->K2_DestroyActor();
-        QD_INFO(kTag, "slot {}: destroyed stale actor", slot_);
+    // Same world still running (we only *thought* it changed): destroy the actors instead of leaking them. A different
+    // world means the old one is being torn down with our actors in it; calling into them then crashed right after a
+    // death reload, so they are only forgotten.
+    if (world_ && ue::World() == world_) {
+        DestroyWeaponActor();
+        if (actor_ && ue::IsValid(actor_)) {
+            actor_->K2_DestroyActor();
+            QD_INFO(kTag, "slot {}: destroyed stale actor", slot_);
+        }
     }
+    Forget();
+}
+
+void Puppet::Forget() {
+    weapon_ = nullptr;
     pose_.Forget();
     actor_ = nullptr;
     skel_ = nullptr;

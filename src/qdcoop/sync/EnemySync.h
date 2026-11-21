@@ -66,7 +66,7 @@ void         EnemySyncAlias(const SDK::AActor* actor, uint64_t id);
 // ---- test tooling (dev flavour only; debug/DevCommands.cpp). `filter` = case-insensitive part of the enemy's class or
 // ---- actor name; the nearest match to the local player is used. Results go to the log with tag [edbg].
 void DebugEnemyList(const std::string& filter);                 // one line per matching enemy
-bool DebugEnemyGoto(const std::string& filter, float dist);     // teleport next to it, facing it
+bool DebugEnemyGoto(const std::string& filter, float dist, float angleDeg = 0);   // teleport next to it, facing it (angle: from another side)
 void DebugEnemyHp(const std::string& filter, float fraction);   // owner only: HP = fraction x max
 void DebugEnemyHit(const std::string& filter, float damage);    // a hit by the local player (routed like a real one)
 void DebugEnemyWake(const std::string& filter);                 // ActivateTrap on our copy (like walking up to it)

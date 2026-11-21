@@ -46,4 +46,10 @@ std::function<void()>& OnSessionStarted();
 std::function<void()>& OnSessionEnded();
 void AddMemberListener(std::function<void(const Member&, bool joined)> fn);
 
+#if QD_DEV
+// Dev console "join <ip>:<port>": join a host over UDP (the lab boots both copies at once and joins when the host is in
+// its world). False when the transport is not UDP or the session is not up yet.
+bool DevJoinUdp(const std::string& ip, uint16_t port);
+#endif
+
 }  // namespace qd::coop

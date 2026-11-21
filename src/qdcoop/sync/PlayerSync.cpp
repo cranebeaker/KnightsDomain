@@ -13,6 +13,7 @@
 #include "qdcoop/core/Log.h"
 #include "qdcoop/core/Unreal.h"
 #include "qdcoop/sync/Coop.h"
+#include "qdcoop/sync/Party.h"
 #include "qdcoop/sync/Puppet.h"
 #include "qdcoop/ui/I18n.h"
 #include "qdcoop/ui/Overlay.h"
@@ -295,7 +296,7 @@ void SampleAndSend(double now, SDK::ACharacter* ch) {
     s.hpPct = 100;
     if (L.isFsChar) {
         auto* p = static_cast<SDK::AFS_PlayerChar_C*>(ch);
-        dead = p->IsDead;
+        dead = p->IsDead || PartyLocalDowned();   // down: shown lying, not a target
         teleporting = p->Teleporting;
         dashing = p->Dashing;
 
@@ -584,7 +585,7 @@ void Tick(float dt) {
         ++puppets;
 
         const std::string name = m.name.empty() ? ui::Tr("name.default") + std::to_string(slot + 1) : m.name;
-        AddLabel(labels, lc, feet, name, slot == 0 ? kHostColor : kOtherColor);
+        AddLabel(labels, lc, feet, name + PartyLabelSuffix(slot), slot == 0 ? kHostColor : kOtherColor);
     }
 
     // ---- debug dummy
@@ -646,8 +647,8 @@ void PlayerSyncInit() {
         if (r != detail::GuardResult::SehException) return;
         auto& st = S();
         for (auto& rem : st.remotes)
-            if (rem.puppet) rem.puppet->Abandon(), rem.puppet.reset();
-        if (st.dummy) st.dummy->Abandon(), st.dummy.reset();
+            if (rem.puppet) rem.puppet->Forget(), rem.puppet.reset();
+        if (st.dummy) st.dummy->Forget(), st.dummy.reset();
         st.world = nullptr;
         st.halfHeightKnown = false;
         QD_WARN(kTag, "tick failed; puppets dropped and rebuilt");

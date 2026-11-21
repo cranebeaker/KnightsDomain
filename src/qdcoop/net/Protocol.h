@@ -8,7 +8,7 @@
 
 namespace qd::net {
 
-constexpr uint16_t kProtocolVersion = 7;   // v7: Call (boss / arena Blueprint calls); v6: WorldFlags in use, Hazard; v5: EnemyBlob, EnemyEvent Interacted (v4: Woke/CustomAttack, EnemyState flag bit4)
+constexpr uint16_t kProtocolVersion = 8;   // v8: Party (revive, party rest, trading); v7: Call (boss / arena Blueprint calls); v6: WorldFlags in use, Hazard; v5: EnemyBlob, EnemyEvent Interacted (v4: Woke/CustomAttack, EnemyState flag bit4)
 constexpr int      kMaxPlayers = 4;
 constexpr size_t   kMaxNameBytes = 72;    // UTF-8, 24 CJK chars
 constexpr size_t   kMaxItemPathBytes = 256;   // MsgEquip::itemPath
@@ -17,7 +17,7 @@ enum class MsgType : uint8_t {
     Hello = 1, Welcome, Reject, PeerJoined, PeerLeft, NameChanged,
     PlayerState = 20, PlayerEvent, Equip = 22,
     EnemyStates = 40, EnemyEvent, DamageRequest, EnemyOwner = 45, EnemyBlob = 46, EnemyMontage = 47,
-    WorldFlags = 60, InteractRequest, InteractResult, HpScale, Summon, Hazard = 65, Call = 66,
+    WorldFlags = 60, InteractRequest, InteractResult, HpScale, Summon, Hazard = 65, Call = 66, Party = 67,
     Heartbeat = 250,   // consumed by Session
 };
 
@@ -151,6 +151,37 @@ struct MsgCall {
     std::string actorPath, fnPath; Vec3f senderPos; std::vector<uint8_t> params;
 };
 
+// ---- party: revive, party rest, trading ----
+// One message for the party features. fromSlot = the player it is about / who sent it (the host rewrites it with the
+// real sender when relaying a client's message); toSlot = the one player it is for, or kPartyAll. Reliable; host relays.
+// Downed      arg 1 = the sender is down (would have died; a teammate can revive them), 0 = up again
+// Reviving    arg 1 = the sender started reviving toSlot, 0 = stopped
+// Revive      the sender revived toSlot (toSlot stands up at the revive health)
+// Rest        the sender rested (arg 0) or saved (arg 1) at a checkpoint; text = the checkpoint's location data asset
+//             path, pos = the checkpoint. id = a sequence number per sender. Everyone else rests / saves there too.
+// TradeRequest / TradeAccept / TradeDecline / TradeCancel   id = the trade's number (picked by the requester)
+// TradeOffer  items = everything the sender offers now (replaces the last offer; confirmations are reset)
+// TradeConfirm arg 1 = the sender confirms the current offers, 0 = takes it back; id = trade, a = offer version seen
+// TradeCommit the requester, once both confirmed: both sides hand over their offers now (items = what toSlot gets)
+// TradeDone   the receiver of a commit carried it out (arg 1) or could not (0)
+enum class PartyKind : uint8_t {
+    Downed = 1, Reviving, Revive, Rest,
+    TradeRequest = 10, TradeAccept, TradeDecline, TradeCancel, TradeOffer, TradeConfirm, TradeCommit, TradeDone,
+};
+constexpr uint8_t kPartyAll = 0xFF;
+constexpr size_t  kMaxPartyText = 256;
+constexpr size_t  kMaxPartyItems = 40;
+struct PartyItem { std::string path; int32_t count = 0; };   // path = the FS_ItemData_C asset
+struct MsgParty {
+    PartyKind kind = PartyKind::Downed;
+    uint8_t   fromSlot = 0, toSlot = kPartyAll;
+    uint32_t  id = 0;
+    int32_t   arg = 0, a = 0;
+    Vec3f     pos;
+    std::string text;
+    std::vector<PartyItem> items;
+};
+
 // ---- codec ----
 MsgType PeekType(const uint8_t* data, size_t size);   // returns (MsgType)0 if size == 0
 // Reads only [u8 Hello][u16 protocol] of a Hello, so a host can answer a Hello of another protocol version (which it
@@ -163,7 +194,7 @@ bool PeekHelloProtocol(const uint8_t* data, size_t size, uint16_t& protocol);
 QD_MSG(MsgHello) QD_MSG(MsgReject) QD_MSG(MsgWelcome) QD_MSG(MsgPeerJoined) QD_MSG(MsgPeerLeft) QD_MSG(MsgNameChanged)
 QD_MSG(MsgPlayerState) QD_MSG(MsgPlayerEvent) QD_MSG(MsgEquip)
 QD_MSG(MsgEnemyStates) QD_MSG(MsgEnemyEvent) QD_MSG(MsgDamageRequest) QD_MSG(MsgEnemyOwner) QD_MSG(MsgEnemyBlob) QD_MSG(MsgEnemyMontage)
-QD_MSG(MsgWorldFlags) QD_MSG(MsgInteractRequest) QD_MSG(MsgInteractResult) QD_MSG(MsgHpScale) QD_MSG(MsgSummon) QD_MSG(MsgHazard) QD_MSG(MsgCall)
+QD_MSG(MsgWorldFlags) QD_MSG(MsgInteractRequest) QD_MSG(MsgInteractResult) QD_MSG(MsgHpScale) QD_MSG(MsgSummon) QD_MSG(MsgHazard) QD_MSG(MsgCall) QD_MSG(MsgParty)
 #undef QD_MSG
 
 // Splits a large enemy snapshot into several complete MsgEnemyStates messages, each <= maxBytes when encoded

@@ -21,7 +21,9 @@
 #include "qdcoop/core/Unreal.h"
 #include "qdcoop/net/Protocol.h"
 #include "SDK/FS_PlayerChar_classes.hpp"
+#include "qdcoop/sync/Coop.h"
 #include "qdcoop/sync/EnemySync.h"
+#include "qdcoop/sync/Party.h"
 #include "qdcoop/sync/PoseDriver.h"
 #include "qdcoop/sync/Puppet.h"
 #include "qdcoop/ui/Overlay.h"
@@ -209,6 +211,14 @@ void Run(const std::string& line) {
             SDK::UGameplayStatics::OpenLevel(w, qd::ue::MakeName(map), true, SDK::FString());
         }
     }
+    else if (cmd == "join") {   // join <ip>:<port> (UDP)
+        std::string arg; in >> arg;
+        const size_t c = arg.rfind(':');
+        const std::string ip = arg.substr(0, c);
+        const int port = c == std::string::npos ? 27777 : std::atoi(arg.c_str() + c + 1);
+        QD_INFO(kTag, "join {}", qd::coop::DevJoinUdp(ip, static_cast<uint16_t>(port)) ? "sent" : "not possible");
+    }
+    else if (cmd == "party") { std::string rest; std::getline(in, rest); qd::sync::PartyDebug(rest); }
     else if (cmd == "god") { int v = 1; in >> v; g_god = v != 0; QD_INFO(kTag, "god {}", g_god ? 1 : 0); }
     else if (cmd == "where") {
         if (auto* ch = qd::ue::LocalCharacter()) {
@@ -218,7 +228,7 @@ void Run(const std::string& line) {
         } else QD_INFO(kTag, "where: no local character (world {})", qd::ue::World() ? qd::ue::Name(qd::ue::World()) : std::string("-"));
     }
     else if (cmd == "elist") { std::string f; in >> f; qd::sync::DebugEnemyList(f); }
-    else if (cmd == "egoto") { std::string f; float d = 900; in >> f >> d; qd::sync::DebugEnemyGoto(f, d); }
+    else if (cmd == "egoto") { std::string f; float d = 900, ang = 0; in >> f >> d >> ang; qd::sync::DebugEnemyGoto(f, d, ang); }
     else if (cmd == "ehp") { std::string f; float fr = 0.5f; in >> f >> fr; qd::sync::DebugEnemyHp(f, fr); }
     else if (cmd == "ehit") { std::string f; float dmg = 10; in >> f >> dmg; qd::sync::DebugEnemyHit(f, dmg); }
     else if (cmd == "ewake") { std::string f; in >> f; qd::sync::DebugEnemyWake(f); }

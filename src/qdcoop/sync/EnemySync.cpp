@@ -35,6 +35,7 @@
 #include "qdcoop/core/Log.h"
 #include "qdcoop/core/Unreal.h"
 #include "qdcoop/sync/Coop.h"
+#include "qdcoop/sync/Party.h"
 #include "qdcoop/ui/I18n.h"
 #include "qdcoop/ui/Overlay.h"
 
@@ -175,6 +176,7 @@ constexpr float  kOwnerFightRange  = 2500.0f;   // cm: beyond this the owner is 
 // 1.0.6: 45 m was the size of the test arena. The main Whaleking's arena is far larger, players there were often more
 // than 45 m from the boss, the lock was dropped and the boss changed machine ten times in 90 s.
 constexpr float  kBossLockRange    = 9000.0f;
+constexpr double kBossLockIdleSec  = 8.0;       // a lock holder with no hit of their own this long hands it to the hitter
 constexpr double kRiseWatchSec     = 5.0;       // a dormant enemy is watched this long after ActivateTrap for its rise
 // 1.0.6 boss targets. A locked boss runs on one machine, and there the game's "target player" is always that
 // machine's player, so bosses only ever fought their owner. The owner now picks the target among all players near
@@ -541,7 +543,7 @@ bool IsFsPlayer(const SDK::UObject* a) {
     return a && Valid(pc) && a->IsA(pc);
 }
 bool LocalDead(SDK::ACharacter* ch) {
-    return IsFsPlayer(ch) && static_cast<SDK::AFS_PlayerChar_C*>(ch)->IsDead;
+    return IsFsPlayer(ch) && (static_cast<SDK::AFS_PlayerChar_C*>(ch)->IsDead || PartyLocalDowned());
 }
 
 float QueryMaxHp(SDK::AEnemyBase_C* en) {
@@ -1470,7 +1472,16 @@ void HostEvaluateOwners(double now) {
             e.bossLockSlot = cur;
             QD_INFO(kTag, "{:016X} ({}): boss lock -> P{}", id, ue::Name(en), cur + 1);
         }
-        if (boss && e.bossLockSlot != 0xFF) {
+        if (boss && e.bossLockSlot != 0xFF && e.lastHitSlot < net::kMaxPlayers && e.lastHitSlot != cur &&
+            now - e.lastHitAt < kHitAggroSec && CandAlive(e.lastHitSlot) && now - rec.changedAt >= kHitSwitchMinSec &&
+            (cur >= net::kMaxPlayers || now - e.hitAt[cur] >= kBossLockIdleSec)) {
+            // the lock holder stopped fighting it (no hit of their own for a while) and another player is hitting it:
+            // the boss turns to them (Cocker: the client woke it and stood back, the host hit it and was ignored)
+            QD_INFO(kTag, "{:016X} ({}): boss lock P{} -> P{} (the holder stopped fighting)", id, ue::Name(en), cur + 1,
+                    e.lastHitSlot + 1);
+            e.bossLockSlot = 0xFF;
+            changes.push_back({id, e.lastHitSlot, "命中", true});
+        } else if (boss && e.bossLockSlot != 0xFF) {
             // locked: hits and proximity never move it
         } else if (e.lastHitSlot < net::kMaxPlayers && now - e.lastHitAt < kHitAggroSec && CandAlive(e.lastHitSlot)) {
             // 1. aggro: the last hitter, unless the current owner is fighting it (1.0.5: engaged, within 25 m and
@@ -3980,7 +3991,7 @@ void DebugEnemyList(const std::string& filter) {
     QD_INFO("edbg", "list '{}': {} of {} entries (session {}, slot {})", filter, n, s.entries.size(), s.active ? 1 : 0, s.localSlot);
 }
 
-bool DebugEnemyGoto(const std::string& filter, float dist) {
+bool DebugEnemyGoto(const std::string& filter, float dist, float angleDeg) {
     Entry* e = DebugFind(filter, false);
     SDK::ACharacter* ch = ue::LocalCharacter();
     SDK::APlayerController* pc = ue::LocalController();
@@ -3993,24 +4004,56 @@ bool DebugEnemyGoto(const std::string& filter, float dist) {
     // Only stand where there is ground: try 12 directions around the enemy (the one towards us first), trace down from
     // above the enemy, and accept a hit within 6 m of the enemy's height. The first version put players in the sea
     // next to the Whaleking's platform.
-    const float base = std::atan2(dy, dx);
-    SDK::FVector at{};
-    bool found = false;
-    for (int i = 0; i < 12 && !found; ++i) {
-        const float a = base + static_cast<float>(i) * 3.14159265f / 6.0f;
-        const SDK::FVector top(p.X + std::cos(a) * dist, p.Y + std::sin(a) * dist, p.Z + 500.0f);
-        const SDK::FVector bottom(top.X, top.Y, p.Z - 1500.0f);
+    const float base = std::atan2(dy, dx) + angleDeg * 3.14159265f / 180.0f;   // angle: another side of it
+    auto groundAt = [&](float x, float y, float& gz) {
+        const SDK::FVector top(x, y, p.Z + 500.0f);
+        const SDK::FVector bottom(x, y, p.Z - 1500.0f);
         SDK::FHitResult hit{};
         SDK::TArray<SDK::AActor*> ignore;
         const bool blocked = SDK::UKismetSystemLibrary::LineTraceSingle(ch, top, bottom, SDK::ETraceTypeQuery::TraceTypeQuery1, false,
                                                                         ignore, SDK::EDrawDebugTrace::None, &hit, true,
                                                                         SDK::FLinearColor(), SDK::FLinearColor(), 0.0f);
-        if (!blocked || !hit.bBlockingHit) continue;
-        const float gz = hit.ImpactPoint.Z;
-        if (std::fabs(gz - p.Z) > 600.0f) continue;
-        at = SDK::FVector(top.X, top.Y, gz + 110.0f);
-        found = true;
+        if (!blocked || !hit.bBlockingHit) return false;
+        gz = hit.ImpactPoint.Z;
+        return true;
+    };
+    // The floor the enemy stands on: a spot on that level first (a boss does not step down off its platform to a
+    // player below it, so it stood still and never attacked: Grave Guardian), any ground within 6 m after that.
+    // (the capsule's bottom: a trace straight down from above would hit the enemy itself)
+    float enemyFloor = p.Z;
+    bool haveFloor = false;
+    if (SDK::UCapsuleComponent* cap = e->enemy->CapsuleComponent; Valid(cap)) {
+        enemyFloor = p.Z - cap->CapsuleHalfHeight * cap->RelativeScale3D.Z;
+        haveFloor = true;
     }
+    SDK::FVector at{};
+    bool found = false;
+    float usedDist = dist;
+    // Around the Whaleking most of a ring lands in the sea: if nothing on the asked ring fits, try a closer ring,
+    // then wider ones, so the player still ends up on the nearest real ground instead of not moving at all.
+    // (no wider than 1.5x: an 80 m ring once put the host outside the King of Stone's fight)
+    const float rings[] = {1.0f, 0.6f, 1.5f};
+    for (float k : rings) {
+        const float rd = std::max(150.0f, dist * k);
+        for (int pass = haveFloor ? 0 : 1; pass < 2 && !found; ++pass) {
+            for (int i = 0; i < 24 && !found; ++i) {
+                const float a = base + static_cast<float>(i) * 3.14159265f / 12.0f;
+                const float x = p.X + std::cos(a) * rd, y = p.Y + std::sin(a) * rd;
+                float gz = 0;
+                if (!groundAt(x, y, gz)) continue;
+                // level with its feet is always right (the King of Stone's feet are 10 m below its centre, outside the 6 m window);
+                // otherwise within 6 m of its centre
+                if (pass == 0 && std::fabs(gz - enemyFloor) > 30.0f) continue;
+                if (pass == 1 && std::fabs(gz - p.Z) > 600.0f) continue;
+                at = SDK::FVector(x, y, gz + 110.0f);
+                usedDist = rd;
+                found = true;
+            }
+        }
+        if (found) break;
+    }
+    if (found && usedDist != dist)
+        QD_INFO("edbg", "goto {}: nothing at {:.0f} cm, used a {:.0f} cm ring", ue::ClassName(e->enemy), dist, usedDist);
     if (!found) {
         QD_WARN("edbg", "goto {}: no ground within {:.0f} cm around it, not moving", ue::ClassName(e->enemy), dist);
         return false;
@@ -4019,7 +4062,8 @@ bool DebugEnemyGoto(const std::string& filter, float dist) {
     SDK::FRotator r{};
     r.Yaw = std::atan2(p.Y - at.Y, p.X - at.X) * 180.0f / 3.14159265f;
     pc->SetControlRotation(r);
-    QD_INFO("edbg", "goto {} at ({:.0f},{:.0f},{:.0f}), {:.0f} cm away", ue::ClassName(e->enemy), p.X, p.Y, p.Z, dist);
+    QD_INFO("edbg", "goto {} at ({:.0f},{:.0f},{:.0f}), {:.0f} cm away: player to ({:.0f},{:.0f},{:.0f}), enemy floor {:.0f}",
+            ue::ClassName(e->enemy), p.X, p.Y, p.Z, dist, at.X, at.Y, at.Z, enemyFloor);
     return true;
 }
 
