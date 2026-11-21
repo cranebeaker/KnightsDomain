@@ -4070,7 +4070,7 @@ bool DebugEnemyGoto(const std::string& filter, float dist, float angleDeg) {
     if (found && usedDist != dist)
         QD_INFO("edbg", "goto {}: nothing at {:.0f} cm, used a {:.0f} cm ring", ue::ClassName(e->enemy), dist, usedDist);
     if (!found) {
-        QD_WARN("edbg", "goto {}: no ground within {:.0f} cm around it, not moving", ue::ClassName(e->enemy), dist);
+        QD_WARN("edbg", "goto {} at ({:.0f},{:.0f},{:.0f}): no ground within {:.0f} cm around it, not moving", ue::ClassName(e->enemy), p.X, p.Y, p.Z, dist);
         return false;
     }
     ch->K2_SetActorLocation(at, false, nullptr, true);
