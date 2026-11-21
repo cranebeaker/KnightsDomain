@@ -161,6 +161,13 @@ constexpr float  kNearAssignRange  = 3000.0f;   // cm: "nearest" only hands an e
 constexpr float  kNearMarginCm     = 800.0f;    // ... who is at least 8 m closer than the current owner
 constexpr float  kNearMarginRatio  = 0.7f;      // ... and at most 70 % of the current owner's distance
 constexpr double kHitSwitchMinSec  = 3.0;       // hits: floor between two changes
+// Balance: an enemy only fights the machine that runs it, and every enemy starts on the host, so with two players side
+// by side the "clearly closer" rule above never fired and the host took every enemy of a group while the client was
+// left alone. An ordinary enemy that is not fighting yet (or only just started) now goes to the player with the fewest
+// enemies on them among the players about as close as the nearest one.
+constexpr float  kBalanceBandCm    = 700.0f;    // cm: players within this of the nearest player's distance count as near
+constexpr double kBalanceFreshSec  = 2.5;       // an enemy this new to its fight (no hit from its owner yet) can still move
+constexpr int    kBalanceMinGap    = 2;         // move only when the owner has at least this many more enemies
 // bosses / elites keep private Blueprint state per copy (phase counters, intro flags). Every hand-over risks a
 // repeated phase change, so they change owner rarely: a hit moves them at most every 12 s, proximity never while the
 // owner is alive and near.
@@ -275,6 +282,7 @@ struct Entry {
     double  forcedAt = -100;                       // client: last Force Respawn of this spawner (1.0.5)
     bool    savedAiDisabled = false;               // bIsAIDisabled of the copy when we started following it (1.0.5)
     uint8_t bossLockSlot = 0xFF;                   // host: the fighting boss stays with this slot (1.0.4)
+    double  engagedSince = -1;                     // host: when it started fighting its current owner (-1: not)
     uint64_t pairLeader = 0;                       // host: the paired boss this one follows (0 = none) (1.0.6)
     float   threat[net::kMaxPlayers] = {0, 0, 0, 0};   // owner: damage dealt per slot, fading (1.0.6)
     double  threatAt = -100;                       // owner: last fade / last damage
@@ -1365,6 +1373,37 @@ void HostLinkBossPairs() {
     }
 }
 
+// Rule 2a: the player an ordinary enemy should go to for balance, or 0xFF to leave it. Only an enemy that is not
+// fighting its owner, or started within kBalanceFreshSec and has no hit from its owner since, may move; the pick is the
+// player with the fewest enemies among the living players within 30 m of it and about as close as the nearest one.
+uint8_t BalancePick(const SDK::FVector& pos, Entry& e, uint8_t cur, const int* load, double now) {
+    auto& s = S();
+    if (e.hostRun || cur >= net::kMaxPlayers || !CandAlive(cur)) return 0xFF;
+    if (Engaged(e, e.enemy, cur, now)) {
+        if (e.engagedSince < 0) e.engagedSince = now;
+        if (now - e.engagedSince > kBalanceFreshSec || e.hitAt[cur] >= e.engagedSince) return 0xFF;
+    } else {
+        e.engagedSince = -1;
+    }
+    const Cand* nearest = NearestCand(pos, e, now);
+    if (!nearest) return 0xFF;
+    const float dN = Dist(pos, nearest->pos);
+    const Cand* owner = CandOf(cur);
+    if (dN > kNearAssignRange || Dist(pos, owner->pos) > dN + kBalanceBandCm) return 0xFF;   // rule 3 handles a far owner
+    const Cand* best = nullptr;
+    for (const Cand& c : s.cands) {
+        if (!c.alive || c.slot >= net::kMaxPlayers || c.slot == cur) continue;
+        if (c.slot == e.excludeSlot && now < e.excludeUntil) continue;
+        const float d = Dist(pos, c.pos);
+        if (d > kNearAssignRange || d > dN + kBalanceBandCm) continue;
+        if (!best || load[c.slot] < load[best->slot] ||
+            (load[c.slot] == load[best->slot] && d < Dist(pos, best->pos)))
+            best = &c;
+    }
+    if (!best || load[cur] - load[best->slot] < kBalanceMinGap) return 0xFF;
+    return best->slot;
+}
+
 void HostEvaluateOwners(double now) {
     auto& s = S();
     std::vector<OwnerChange> changes;
@@ -1402,6 +1441,17 @@ void HostEvaluateOwners(double now) {
     }
     for (const OwnerChange& c : changes) HostSetOwner(c.id, c.slot, c.reason, c.align);
     changes.clear();
+
+    // Balance input: ordinary enemies on each player (run by their machine and within 30 m of them), kept up to date
+    // as this pass moves enemies so one pass does not hand a whole group to the same player.
+    int load[net::kMaxPlayers] = {0, 0, 0, 0};
+    for (auto& [id, e] : s.entries) {
+        SDK::AEnemyBase_C* en = Valid(e.enemy) ? e.enemy : nullptr;
+        if (!en || en->bDead || IsBossLike(e, en) || e.hostRun) continue;
+        const uint8_t o = OwnerOf(id).slot;
+        const Cand* oc = CandOf(o);
+        if (o < net::kMaxPlayers && oc && oc->alive && Dist(en->K2_GetActorLocation(), oc->pos) <= kNearAssignRange) ++load[o];
+    }
 
     for (auto& [id, e] : s.entries) {
         SDK::AEnemyBase_C* en = Valid(e.enemy) ? e.enemy : nullptr;
@@ -1508,6 +1558,13 @@ void HostEvaluateOwners(double now) {
                         if (k.slot == cur && k.alive && Dist(pos, k.pos) <= kOwnerFightRange) ownerFights = true;
                 if (!ownerFights) changes.push_back({id, e.lastHitSlot, "命中", true});
             }
+        } else if (const uint8_t to = boss ? 0xFF : BalancePick(pos, e, cur, load, now);
+                   to != 0xFF && now - rec.changedAt >= kHitSwitchMinSec) {
+            // 2a. balance (see kBalanceBandCm): not fighting yet, or only just started and its owner has not hit it
+            --load[cur];
+            ++load[to];
+            e.engagedSince = -1;
+            changes.push_back({id, to, "分担", true});
         } else if (CandAlive(cur) && Engaged(e, en, cur, now)) {
             // 2. chasing / attacking its owner: keep
         } else if (now - rec.changedAt >= kOwnerSwitchSec) {
