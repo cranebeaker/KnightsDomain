@@ -1144,6 +1144,12 @@ uint64_t SpawnerId(SDK::AEnemySpawner_C* sp) {
     return id;
 }
 
+// Id of a second same-class enemy of one spawner: the same on every machine.
+uint64_t TwinId(uint64_t spawnerId) {
+    const uint64_t v[2] = {spawnerId, 0x7477696E7477696EULL};
+    return ue::Fnv1a64(std::string_view(reinterpret_cast<const char*>(v), sizeof(v)));
+}
+
 // True when the entry now points at a different enemy actor than before (respawn / first sight).
 bool AttachEnemy(Entry& e, SDK::AEnemyBase_C* en) {
     bool changed = false;
@@ -1205,6 +1211,15 @@ void Rebuild(double now) {
                     QD_INFO(kTag, "{:016X}: second copy {} after a forced respawn, removed", it->second, ue::Name(en));
                     en->K2_DestroyActor();
                     continue;
+                } else if (Valid(owner.enemy) && owner.enemy->Class == en->Class) {
+                    // a second enemy of the spawner's class (a spawn-on-Activate spawner that had also been told to
+                    // respawn): an id derived from the spawner's, not from the actor's runtime name, which differs
+                    // per machine
+                    const uint64_t twin = TwinId(it->second);
+                    auto tw = s.entries.find(twin);
+                    if (tw == s.entries.end() || !Valid(tw->second.enemy) || tw->second.enemy == en ||
+                        tw->second.enemy->bDead || !byEnemy.contains(tw->second.enemy))
+                        id = twin;
                 }
             }
         }
