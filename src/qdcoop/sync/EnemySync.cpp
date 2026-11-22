@@ -2038,7 +2038,29 @@ void RiseWatchTick(double now) {
 // (by then the AI flag is already on, which is why 1.0.5 missed the Whaleking's rise).
 std::vector<TrapCall> g_aiCalls;
 
+// Issue 2 (the Whaleking kept falling from the sky on a client): the game's ActivateEnemyAI only does anything while
+// the enemy's AI is off, and then starts it the dormant way (ActivateTrap -> the boss's intro). A copy we only follow
+// keeps its AI off on purpose (its owner runs it), so every arena trigger it passed (the Whaleking's spawner calls
+// ActivateEnemyAI whenever a player walks into its cylinder) restarted the intro mid fight here. Once this copy has
+// risen, the game's own call is skipped while we follow it; our own wake and the hand-over (wakingLocal) still run.
+bool SkipFollowedReactivate(SDK::AEnemyBase_C* en) {
+    auto& s = S();
+    if (s.wakingLocal || !s.active || !en || en->bDead) return false;
+    auto bi = s.byEnemy.find(en);
+    if (bi == s.byEnemy.end()) return false;
+    auto ei = s.entries.find(bi->second);
+    if (ei == s.entries.end()) return false;
+    const Entry& e = ei->second;
+    if (EnemyOwnedHere(e.id) || e.wokenFor != en) return false;
+    static std::unordered_map<const void*, int> logged;
+    if (++logged[en] <= 3)
+        QD_INFO(kTag, "{:016X} ({}): the game asked to start its AI again; it has risen and runs on P{}, skipped", e.id,
+                ue::Name(en), OwnerOf(e.id).slot + 1);
+    return true;
+}
+
 bool OnActivateAiPre(hooks::CallInfo& ci) {
+    if (ci.object && SkipFollowedReactivate(static_cast<SDK::AEnemyBase_C*>(ci.object))) return true;
     if (ci.object && g_aiCalls.size() < 64) {
         auto* en = static_cast<SDK::AEnemyBase_C*>(ci.object);
         g_aiCalls.push_back({ci.object, en->InTrapMode, en->bIsAIDisabled});

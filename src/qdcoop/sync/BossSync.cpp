@@ -42,6 +42,7 @@
 #include <cstring>
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 namespace qd::sync {
@@ -546,6 +547,8 @@ void PullIn(const net::MsgCall& m) {
     QD_INFO(kTag, "arena closing: moved next to P{} ({:.0f} m away)", m.ownerSlot + 1, d / 100.0f);
 }
 
+void RemovePoisonHere(SDK::AActor* boss);
+
 void Run(const Pending& p) {
     auto& s = S();
     const Fn& f = kFns[p.fn];
@@ -556,6 +559,11 @@ void Run(const Pending& p) {
         self = EnemyActorOfId(m.enemyId);
     } else {
         self = static_cast<SDK::AActor*>(ActorByPath(m.actorPath));
+    }
+    const std::string fnName = m.fnPath.substr(m.fnPath.rfind(':') + 1);
+    if (m.target == net::kCallEnemy && (fnName == "RemovePoison" || fnName == "KillPoisonCircles")) {
+        RemovePoisonHere(self);   // also when our copy of the boss is dead or already removed
+        if (!self) return;
     }
     if (!self) {
         ++s.dropped;
@@ -617,27 +625,75 @@ constexpr const char* kPoisonManager = "/Game/Enemies/WhaleKing/WhaleKingPoisonM
 constexpr const char* kPoisonCircle = "/Game/Enemies/WhaleKing/WhaleKingPoisonCircle.WhaleKingPoisonCircle_C";
 struct RawArray { void* data; int32_t num; int32_t max; };
 
+// The manager's list = every pool in the world (the engine fills the array, so its memory stays the engine's).
+void RefreshPoisonList(SDK::AActor* mgr, SDK::UClass* circleCls) {
+    SDK::UObject* lib = SDK::UGameplayStatics::GetDefaultObj();
+    static SDK::UFunction* fn = nullptr;
+    if (!ue::IsValid(fn)) fn = ue::FindFunction(lib, "GetAllActorsOfClass");
+    if (!fn) return;
+    auto* list = reinterpret_cast<RawArray*>(reinterpret_cast<uint8_t*>(mgr) + kPoisonListOffset);
+    SDK::Params::GameplayStatics_GetAllActorsOfClass p{};
+    p.WorldContextObject = mgr;
+    p.ActorClass = circleCls;
+    std::memcpy(&p.OutActors, list, sizeof(RawArray));
+    ue::CallFunction(lib, fn, &p);
+    std::memcpy(list, &p.OutActors, sizeof(RawArray));
+}
+
+std::unordered_set<SDK::AActor*>& PoisonOff() { static std::unordered_set<SDK::AActor*> v; return v; }
+
+// The followed boss's copy has no CurrentPoisonManager (only the owner's spawn node sets it), so the owner's
+// RemovePoison does nothing here, and a call that comes after our copy died (or was removed) is not run at all. So
+// here: every pool is switched off the way the owner's KillPoisonCircles does it (each pool's Deactivate: its effect
+// and collision off, gone 5 s later), and the managers of that boss (null: of every boss) stop with an empty list.
+void RemovePoisonHere(SDK::AActor* boss) {
+    SDK::UClass* mgrCls = ue::FindClass(kPoisonManager);
+    SDK::UClass* circleCls = mgrCls ? ue::FindClass(kPoisonCircle) : nullptr;
+    if (!circleCls) return;
+    std::vector<SDK::AActor*> circles;
+    ActorsOfClass(circleCls, circles);
+    int off = 0;
+    for (SDK::AActor* c : circles) {
+        if (!ue::IsValid(c)) continue;
+        if (SDK::UFunction* fn = ue::FindFunction(c, "Deactivate")) {
+            uint8_t parms[16] = {};
+            ue::CallFunction(c, fn, parms);
+            ++off;
+        }
+    }
+    int managers = 0;
+    if (mgrCls) {
+        std::vector<SDK::AActor*> list;
+        ActorsOfClass(mgrCls, list);
+        for (SDK::AActor* mgr : list) {
+            if (!mgr || (boss && mgr->Owner && mgr->Owner != boss)) continue;
+            SDK::UFunction* fn = ue::FindFunction(mgr, "RemovePoison");
+            if (!fn) continue;
+            RefreshPoisonList(mgr, circleCls);
+            uint8_t parms[16] = {};
+            ue::CallFunction(mgr, fn, parms);
+            PoisonOff().insert(mgr);
+            ++managers;
+        }
+    }
+    QD_INFO(kTag, "poison off here: {} pools, {} managers", off, managers);
+}
+
 void FollowPoison() {
     SDK::UClass* mgrCls = ue::FindClass(kPoisonManager);
     SDK::UClass* circleCls = mgrCls ? ue::FindClass(kPoisonCircle) : nullptr;
     if (!mgrCls || !circleCls) return;
     std::vector<SDK::AActor*> managers;
     ActorsOfClass(mgrCls, managers);
-    SDK::UObject* lib = SDK::UGameplayStatics::GetDefaultObj();
-    static SDK::UFunction* fn = nullptr;
-    if (!ue::IsValid(fn)) fn = ue::FindFunction(lib, "GetAllActorsOfClass");
-    if (!fn) return;
     for (SDK::AActor* mgr : managers) {
         if (!mgr || !mgr->Owner) continue;
         const uint64_t boss = EnemyIdOfActor(mgr->Owner);
         if (boss == 0 || EnemyOwnedHere(boss)) continue;
-        auto* list = reinterpret_cast<RawArray*>(reinterpret_cast<uint8_t*>(mgr) + kPoisonListOffset);
-        SDK::Params::GameplayStatics_GetAllActorsOfClass p{};
-        p.WorldContextObject = mgr;
-        p.ActorClass = circleCls;
-        std::memcpy(&p.OutActors, list, sizeof(RawArray));
-        ue::CallFunction(lib, fn, &p);
-        std::memcpy(list, &p.OutActors, sizeof(RawArray));
+        RefreshPoisonList(mgr, circleCls);
+        // the boss died here: its pools go, as the owner's do (a lost or late RemovePoison never leaves them behind)
+        auto* en = static_cast<SDK::AEnemyBase_C*>(mgr->Owner);
+        if (ue::IsValid(en) && en->IsA(SDK::AEnemyBase_C::StaticClass()) && en->bDead && !PoisonOff().count(mgr))
+            RemovePoisonHere(mgr->Owner);
     }
 }
 
@@ -648,6 +704,7 @@ void Tick(float dt) {
         FollowPoison();
     }
     if (!coop::InSession()) {
+        PoisonOff().clear();
         s.outbox.clear();
         s.inbox.clear();
         s.localAt.clear();
