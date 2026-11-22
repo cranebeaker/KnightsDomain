@@ -11,6 +11,9 @@ void Shutdown();
 
 bool IsMenuOpen();  // F5 (config menuKey) toggles; while open, game keyboard/mouse input is swallowed
 void SetMenuOpen(bool open);
+// Dev (`kd menu <tab> [scroll 0..1]`): open the menu on that tab, filling the game window, scrolled to that fraction
+// of the tab (for screenshots in the test lab).
+void DebugShowMenu(const std::string& tab, float scroll);
 
 // A tab in the F5 window. draw() runs on the render thread inside ImGui::BeginTabItem; keep it fast and never touch UObjects there —
 // read state you cached on the game thread, and gamethread::Post() any action.

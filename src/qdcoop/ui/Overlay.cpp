@@ -467,14 +467,14 @@ void DrawOutlinedText(ImDrawList* dl, ImVec2 pos, ImU32 color, float alpha, cons
     dl->AddText(pos, body, b, e);
 }
 
-void DrawWorldLabels() {
+void DrawWorldLabels() {   // behind the menu (background list): a name tag never covers the F5 window
     std::vector<WorldLabel> labels;
     {
         std::lock_guard lk(g_labelsMx);
         labels = g_labels;
     }
     if (labels.empty()) return;
-    ImDrawList* dl = ImGui::GetForegroundDrawList();
+    ImDrawList* dl = ImGui::GetBackgroundDrawList();
     for (const auto& l : labels) {
         if (l.alpha <= 0.01f || l.text.empty()) continue;
         const ImVec2 size = ImGui::CalcTextSize(l.text.c_str());
@@ -528,7 +528,22 @@ void DrawToasts() {
     }
 }
 
+std::mutex g_shotMx;
+std::string g_shotTab;       // DebugShowMenu: tab to select and window to fill, for a few frames
+float g_shotScroll = 0.0f;
+int g_shotFrames = 0;
+
 void DrawMenu() {
+    std::string shotTab;
+    float shotScroll = 0.0f;
+    {
+        std::lock_guard lk(g_shotMx);
+        if (g_shotFrames > 0) {
+            --g_shotFrames;
+            shotTab = g_shotTab;
+            shotScroll = g_shotScroll;
+        }
+    }
     std::vector<Tab> tabs;
     {
         std::lock_guard lk(g_tabsMx);
@@ -541,6 +556,10 @@ void DrawMenu() {
     ImGuiIO& io = ImGui::GetIO();
     ImGui::SetNextWindowPos(ImVec2(io.DisplaySize.x * 0.5f, io.DisplaySize.y * 0.5f), ImGuiCond_FirstUseEver, ImVec2(0.5f, 0.5f));
     ImGui::SetNextWindowSize(ImVec2(600, 480), ImGuiCond_FirstUseEver);
+    if (!shotTab.empty()) {
+        ImGui::SetNextWindowPos(ImVec2(0, 0), ImGuiCond_Always);
+        ImGui::SetNextWindowSize(io.DisplaySize, ImGuiCond_Always);
+    }
     bool open = true;
     // fixed English title in both languages ("###" keeps the window id stable across the rename).
     if (ImGui::Begin("Knights' Domain — by Mangolotis###qdcoop_main", &open, ImGuiWindowFlags_NoCollapse)) {
@@ -550,8 +569,10 @@ void DrawMenu() {
             for (auto& t : tabs) {
                 if (IsDebugTab(t.id)) continue;
                 const std::string label = std::string(Tr(t.title.c_str())) + "###" + t.id;
-                if (ImGui::BeginTabItem(label.c_str())) {
+                const ImGuiTabItemFlags tf = !shotTab.empty() && t.id == shotTab ? ImGuiTabItemFlags_SetSelected : 0;
+                if (ImGui::BeginTabItem(label.c_str(), nullptr, tf)) {
                     if (t.draw) t.draw();
+                    if (!shotTab.empty() && shotScroll >= 0.999f) ImGui::SetScrollHereY(1.0f);
                     ImGui::EndTabItem();
                 }
             }
@@ -559,6 +580,7 @@ void DrawMenu() {
         }
         ImGui::Separator();
         ImGui::TextDisabled("%s", TrF("menu.footer", config::Get().menuKey).c_str());
+        if (!shotTab.empty() && shotScroll < 0.999f) ImGui::SetScrollY(shotScroll * ImGui::GetScrollMaxY());
     }
     ImGui::End();
     if (!open) SetMenuOpen(false);
@@ -823,6 +845,16 @@ void Shutdown() {
 }
 
 bool IsMenuOpen() { return g_menuOpen.load(); }
+
+void DebugShowMenu(const std::string& tab, float scroll) {
+    {
+        std::lock_guard lk(g_shotMx);
+        g_shotTab = tab;
+        g_shotScroll = std::clamp(scroll, 0.0f, 1.0f);
+        g_shotFrames = 120;
+    }
+    SetMenuOpen(true);
+}
 
 void SetMenuOpen(bool open) {
     g_panelMenu = open;

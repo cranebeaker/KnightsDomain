@@ -226,6 +226,9 @@ void Run(const std::string& line) {
         qd::sync::DifficultyChanged();
         QD_INFO(kTag, "difficulty {}", qd::config::Get().difficulty);
     }
+    else if (cmd == "menu") {   // menu <tab id> [scroll 0..1]: open the F5 menu on that tab, filling the window
+        std::string t = "coop"; float sc = 0; in >> t >> sc; qd::ui::DebugShowMenu(t, sc);
+    }
     else if (cmd == "god") { int v = 1; in >> v; g_god = v != 0; QD_INFO(kTag, "god {}", g_god ? 1 : 0); }
     else if (cmd == "where") {
         if (auto* ch = qd::ue::LocalCharacter()) {
