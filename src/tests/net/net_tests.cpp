@@ -110,7 +110,8 @@ bool Eq(const MsgInteractResult& a, const MsgInteractResult& b) {
     return a.requestId == b.requestId && a.outcome == b.outcome;
 }
 bool Eq(const MsgHpScale& a, const MsgHpScale& b) {
-    return a.normal == b.normal && a.elite == b.elite && a.boss == b.boss && a.playerCount == b.playerCount;
+    return a.normal == b.normal && a.elite == b.elite && a.boss == b.boss && a.playerCount == b.playerCount &&
+           a.damage == b.damage;
 }
 bool Eq(const MsgSummon& a, const MsgSummon& b) {
     return Eq(a.pos, b.pos) && a.yaw == b.yaw && a.areaName == b.areaName;
@@ -311,7 +312,7 @@ void TestRoundTrips() {
     notify.flags = kDamageHitNotifyOnly;
     RoundTrip("DamageRequest(notify)", notify, MsgType::DamageRequest);
 
-    CHECK(kProtocolVersion == 8);   // v8: Party; v7: Call; v6: WorldFlags in use, Hazard
+    CHECK(kProtocolVersion == 9);   // v8: Party; v7: Call; v6: WorldFlags in use, Hazard
     CHECK(static_cast<uint8_t>(MsgType::EnemyOwner) == 45);
     MsgEnemyOwner eo;
     eo.enemyId = 0x0123456789ABCDEFull;
@@ -343,6 +344,7 @@ void TestRoundTrips() {
     hs.elite = 1.18f;
     hs.boss = 1.25f;
     hs.playerCount = 2;
+    hs.damage = 1.25f;
     RoundTrip("HpScale", hs, MsgType::HpScale);
 
     MsgSummon su;

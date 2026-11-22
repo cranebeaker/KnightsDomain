@@ -76,6 +76,7 @@ constexpr const char* kFnStartAttackState = "/Script/QueensDomain.FS_EnemyCharac
 constexpr const char* kFnTryApplyDamage   = "/Game/Enemies/EnemyBase.EnemyBase_C:TryApplyDamage";
 constexpr const char* kFnManagedDied      = "/Game/Enemies/EnemySpawner.EnemySpawner_C:ManagedEnemyDied";
 constexpr const char* kFnBossBarOn        = "/Game/Player/FS_PlayerChar.FS_PlayerChar_C:ActivateBossHPBar";
+constexpr const char* kFnLocalPlayerDamage = "/Game/Player/FS_PlayerChar.FS_PlayerChar_C:TryApplyDamage";
 constexpr const char* kFnBossBarOff       = "/Game/Player/FS_PlayerChar.FS_PlayerChar_C:DeactivateBossHPBar";
 // Trap mode (EnemyBase.InTrapMode): skeletons lying in pieces, the Grave Guardian kneeling at its shrine. Only the
 // machine whose copy rises calls ActivateTrap, so the rise is shared (EnemyEvent Woke + EnemyState flag bit4).
@@ -166,8 +167,17 @@ constexpr double kHitSwitchMinSec  = 3.0;       // hits: floor between two chang
 // left alone. An ordinary enemy that is not fighting yet (or only just started) now goes to the player with the fewest
 // enemies on them among the players about as close as the nearest one.
 constexpr float  kBalanceBandCm    = 700.0f;    // cm: players within this of the nearest player's distance count as near
-constexpr double kBalanceFreshSec  = 2.5;       // an enemy this new to its fight (no hit from its owner yet) can still move
+// Only the enemies that matter to the players are shared out: those fighting someone and those within this of a
+// player. Counting everything within 30 m handed the client the far, idle ones while every enemy actually attacking
+// stayed on the host (test: B owned three enemies 11 to 28 m away and took no hits). A fighting enemy may move as long
+// as the player it fights has not hit it lately (kHitAggroSec): someone fighting back keeps their enemy.
+constexpr float  kBalanceNearCm    = 1500.0f;
 constexpr int    kBalanceMinGap    = 2;         // move only when the owner has at least this many more enemies
+// A player who just arrived (teleport, fast travel, load) has no copies of the enemies around them yet: their machine
+// cannot run one handed to it (test: given 1 s after B arrived, taken back as silent 3 s later, the rest respawned
+// late on B and never attacked). Balance only hands enemies to a player who has been in one place this long.
+constexpr double kBalanceSettleSec = 6.0;
+constexpr float  kArriveJumpCm     = 1500.0f;   // a move this large between two looks is an arrival, not a walk
 // bosses / elites keep private Blueprint state per copy (phase counters, intro flags). Every hand-over risks a
 // repeated phase change, so they change owner rarely: a hit moves them at most every 12 s, proximity never while the
 // owner is alive and near.
@@ -282,7 +292,6 @@ struct Entry {
     double  forcedAt = -100;                       // client: last Force Respawn of this spawner (1.0.5)
     bool    savedAiDisabled = false;               // bIsAIDisabled of the copy when we started following it (1.0.5)
     uint8_t bossLockSlot = 0xFF;                   // host: the fighting boss stays with this slot (1.0.4)
-    double  engagedSince = -1;                     // host: when it started fighting its current owner (-1: not)
     uint64_t pairLeader = 0;                       // host: the paired boss this one follows (0 = none) (1.0.6)
     float   threat[net::kMaxPlayers] = {0, 0, 0, 0};   // owner: damage dealt per slot, fading (1.0.6)
     double  threatAt = -100;                       // owner: last fade / last damage
@@ -592,8 +601,19 @@ bool EngagedLive(const SDK::AEnemyBase_C* en) { return en->bAggrod || en->bIsCha
 // clients can simulate enemies too, so they scale their own EnemyData with the host's HpScale multipliers.
 
 float PerPlayer(uint8_t tier) {
-    const auto& h = config::Get().hpScale;
+    const auto h = config::CurrentScaling().hp;   // the host's difficulty
     return tier == kBoss ? h.boss : tier == kElite ? h.elite : h.normal;
+}
+
+// Enemy damage to the local player (difficulty): the host's own setting, a client the one the host sent.
+float DamageMult() {
+    const auto& s = S();
+    if (!s.active) return 1.0f;
+    if (s.isHost) {
+        const int n = std::clamp(coop::PlayerCount(), 1, net::kMaxPlayers);
+        return std::max(0.1f, 1.0f + config::CurrentScaling().damage * static_cast<float>(n - 1));
+    }
+    return std::isfinite(s.hpScale.damage) ? std::clamp(s.hpScale.damage, 0.1f, 10.0f) : 1.0f;
 }
 
 float MultFor(uint8_t tier) {
@@ -1278,8 +1298,22 @@ void Rebuild(double now) {
 
 // ------------------------------------------------------------------ players (relevance / nearest)
 
+double g_settledSince[net::kMaxPlayers] = {0, 0, 0, 0};   // balance: when each player last arrived somewhere
+SDK::FVector g_lastCandPos[net::kMaxPlayers];
+bool g_hasCandPos[net::kMaxPlayers] = {false, false, false, false};
+
+void NoteSettled(const Cand& c, double now) {
+    if (c.slot >= net::kMaxPlayers) return;
+    if (!g_hasCandPos[c.slot] || Dist(c.pos, g_lastCandPos[c.slot]) > kArriveJumpCm) g_settledSince[c.slot] = now;
+    g_lastCandPos[c.slot] = c.pos;
+    g_hasCandPos[c.slot] = true;
+}
+
 void BuildCandidates(double now) {
     auto& s = S();
+    for (bool& h : g_hasCandPos) h = false;   // a player missing from this build arrives again when back
+    for (const Cand& c : s.cands)
+        if (c.slot < net::kMaxPlayers) g_hasCandPos[c.slot] = true;
     s.cands.clear();
     SDK::ACharacter* ch = ue::LocalCharacter();
     if (Valid(ch)) s.cands.push_back({s.localSlot, ch->K2_GetActorLocation(), !LocalDead(ch)});
@@ -1297,6 +1331,7 @@ void BuildCandidates(double now) {
         if (!playersync::RemotePose(slot, feet, yaw)) continue;
         s.cands.push_back({slot, SDK::FVector(feet.x, feet.y, feet.z + kFeetToCenter), !rt.dead});
     }
+    for (const Cand& c : s.cands) NoteSettled(c, now);
 }
 
 bool NearAnyPlayer(const SDK::FVector& p, float range) {
@@ -1373,27 +1408,24 @@ void HostLinkBossPairs() {
     }
 }
 
-// Rule 2a: the player an ordinary enemy should go to for balance, or 0xFF to leave it. Only an enemy that is not
-// fighting its owner, or started within kBalanceFreshSec and has no hit from its owner since, may move; the pick is the
-// player with the fewest enemies among the living players within 30 m of it and about as close as the nearest one.
+// Rule 2a: the player an ordinary enemy should go to for balance, or 0xFF to leave it (see kBalanceNearCm). The pick
+// is the settled living player with the fewest enemies among those about as close to it as the nearest one.
 uint8_t BalancePick(const SDK::FVector& pos, Entry& e, uint8_t cur, const int* load, double now) {
     auto& s = S();
     if (e.hostRun || cur >= net::kMaxPlayers || !CandAlive(cur)) return 0xFF;
-    if (Engaged(e, e.enemy, cur, now)) {
-        if (e.engagedSince < 0) e.engagedSince = now;
-        if (now - e.engagedSince > kBalanceFreshSec || e.hitAt[cur] >= e.engagedSince) return 0xFF;
-    } else {
-        e.engagedSince = -1;
-    }
+    const bool fighting = Engaged(e, e.enemy, cur, now);
+    if (fighting && now - e.hitAt[cur] < kHitAggroSec) return 0xFF;   // its player is fighting back: keep
     const Cand* nearest = NearestCand(pos, e, now);
     if (!nearest) return 0xFF;
     const float dN = Dist(pos, nearest->pos);
+    if (dN > (fighting ? kNearAssignRange : kBalanceNearCm)) return 0xFF;   // far and idle: not anyone's yet
     const Cand* owner = CandOf(cur);
-    if (dN > kNearAssignRange || Dist(pos, owner->pos) > dN + kBalanceBandCm) return 0xFF;   // rule 3 handles a far owner
+    if (Dist(pos, owner->pos) > dN + kBalanceBandCm) return 0xFF;   // rule 3 handles a far owner
     const Cand* best = nullptr;
     for (const Cand& c : s.cands) {
         if (!c.alive || c.slot >= net::kMaxPlayers || c.slot == cur) continue;
         if (c.slot == e.excludeSlot && now < e.excludeUntil) continue;
+        if (now - g_settledSince[c.slot] < kBalanceSettleSec) continue;   // just arrived: no copies yet
         const float d = Dist(pos, c.pos);
         if (d > kNearAssignRange || d > dN + kBalanceBandCm) continue;
         if (!best || load[c.slot] < load[best->slot] ||
@@ -1442,7 +1474,7 @@ void HostEvaluateOwners(double now) {
     for (const OwnerChange& c : changes) HostSetOwner(c.id, c.slot, c.reason, c.align);
     changes.clear();
 
-    // Balance input: ordinary enemies on each player (run by their machine and within 30 m of them), kept up to date
+    // Balance input: ordinary enemies on each player (run by their machine and fighting them or within 15 m), kept up to date
     // as this pass moves enemies so one pass does not hand a whole group to the same player.
     int load[net::kMaxPlayers] = {0, 0, 0, 0};
     for (auto& [id, e] : s.entries) {
@@ -1450,7 +1482,9 @@ void HostEvaluateOwners(double now) {
         if (!en || en->bDead || IsBossLike(e, en) || e.hostRun) continue;
         const uint8_t o = OwnerOf(id).slot;
         const Cand* oc = CandOf(o);
-        if (o < net::kMaxPlayers && oc && oc->alive && Dist(en->K2_GetActorLocation(), oc->pos) <= kNearAssignRange) ++load[o];
+        if (o < net::kMaxPlayers && oc && oc->alive &&
+            (Dist(en->K2_GetActorLocation(), oc->pos) <= kBalanceNearCm || Engaged(e, en, o, now)))
+            ++load[o];
     }
 
     for (auto& [id, e] : s.entries) {
@@ -1560,10 +1594,9 @@ void HostEvaluateOwners(double now) {
             }
         } else if (const uint8_t to = boss ? 0xFF : BalancePick(pos, e, cur, load, now);
                    to != 0xFF && now - rec.changedAt >= kHitSwitchMinSec) {
-            // 2a. balance (see kBalanceBandCm): not fighting yet, or only just started and its owner has not hit it
+            // 2a. balance (see kBalanceNearCm): near or fighting, and its player is not fighting back
             --load[cur];
             ++load[to];
-            e.engagedSince = -1;
             changes.push_back({id, to, "分担", true});
         } else if (CandAlive(cur) && Engaged(e, en, cur, now)) {
             // 2. chasing / attacking its owner: keep
@@ -1748,16 +1781,19 @@ void SimTick(double now, float dt) {
 
 void BroadcastHpScale(int count) {
     auto& s = S();
-    const auto& h = config::Get().hpScale;
+    const auto sc = config::CurrentScaling();
+    const auto& h = sc.hp;
     const float extra = static_cast<float>(std::max(0, count - 1));
     net::MsgHpScale m;
     m.normal = 1.0f + h.normal * extra;
     m.elite = 1.0f + h.elite * extra;
     m.boss = 1.0f + h.boss * extra;
+    m.damage = 1.0f + sc.damage * extra;
     m.playerCount = static_cast<uint8_t>(std::clamp(count, 1, net::kMaxPlayers));
     s.hpScale = m;
     coop::Broadcast(net::Channel::Reliable, net::Encode(m));
-    QD_INFO(kTag, "HpScale -> {} players: normal x{:.2f}, elite x{:.2f}, boss x{:.2f}", count, m.normal, m.elite, m.boss);
+    QD_INFO(kTag, "HpScale -> {} players ({}): normal x{:.2f}, elite x{:.2f}, boss x{:.2f}, damage x{:.2f}", count,
+            config::Get().difficulty, m.normal, m.elite, m.boss, m.damage);
 }
 
 uint32_t NextSeed() {
@@ -2060,6 +2096,19 @@ uint8_t UnlistedFighter(Entry& e) {
         if (e.threat[slot] >= 1.0f || (fresh && !dead && sameArea)) return slot;
     }
     return 0xFF;
+}
+
+// Difficulty: damage the local player takes from anything but another player is scaled (enemies, their projectiles
+// and hazards). Only the victim's machine scales it, so a hit is never scaled twice.
+bool OnLocalDamagePre(hooks::CallInfo& ci) {
+    if (!S().active || !ci.params || ci.object != ue::LocalCharacter()) return false;
+    auto* p = static_cast<SDK::Params::FS_PlayerChar_C_TryApplyDamage*>(ci.params);
+    static SDK::UClass* playerCls = nullptr;
+    if (!ue::IsValid(playerCls)) playerCls = ue::FindClass(kPlayerClass);
+    if (p->Applier && playerCls && p->Applier->IsA(playerCls)) return false;
+    const float m = DamageMult();
+    if (m != 1.0f && std::isfinite(p->DamageToApply.DamageAmount)) p->DamageToApply.DamageAmount *= m;
+    return false;
 }
 
 bool OnEnterTrapModePre(hooks::CallInfo& ci) {
@@ -3383,8 +3432,8 @@ void OnHpScale(uint8_t, const uint8_t* data, size_t size) {
     if (!net::Decode(data, size, m)) return;
     s.hpScale = m;
     s.rescalePending = true;   // we may simulate enemies too -> same multipliers as the host (next Tick)
-    QD_INFO(kTag, "host HP scale: {} players, normal x{:.2f}, elite x{:.2f}, boss x{:.2f}", m.playerCount, m.normal,
-            m.elite, m.boss);
+    QD_INFO(kTag, "host HP scale: {} players, normal x{:.2f}, elite x{:.2f}, boss x{:.2f}, damage x{:.2f}", m.playerCount,
+            m.normal, m.elite, m.boss, m.damage);
 }
 
 void OnPlayerState(uint8_t, const uint8_t* data, size_t size) {
@@ -3936,6 +3985,7 @@ void EnemySyncInit() {
         s.nativeTargetHooks = a && b;
     }
     ids.push_back(hooks::AddPre(kFnEnterTrapMode, OnEnterTrapModePre));
+    ids.push_back(hooks::AddPre(kFnLocalPlayerDamage, OnLocalDamagePre));
     ids.push_back(hooks::AddPost(kFnEnterTrapMode, OnEnterTrapModePost));
     ids.push_back(hooks::AddPre(kFnActivateEnemyAI, OnActivateAiPre));
     ids.push_back(hooks::AddPost(kFnActivateEnemyAI, OnActivateAiPost));
@@ -4049,6 +4099,37 @@ void DebugDescribe(Entry& e) {
 }
 
 }  // namespace
+
+void DifficultyChanged() {
+    auto& s = S();
+    if (!s.active || !s.isHost) return;
+    s.resendHpScale = true;      // next tick: the new values go to everyone
+    ApplyScaling("difficulty");  // and the host's own enemies follow now
+}
+
+DifficultyInfo GetDifficultyInfo() {
+    const auto& s = S();
+    DifficultyInfo d;
+    d.inSession = s.active;
+    d.isHost = !s.active || s.isHost;
+    if (s.active && !s.isHost) {
+        d.players = s.hpScale.playerCount;
+        d.normal = s.hpScale.normal;
+        d.elite = s.hpScale.elite;
+        d.boss = s.hpScale.boss;
+        d.damage = s.hpScale.damage;
+        return d;
+    }
+    const int n = s.active ? std::clamp(coop::PlayerCount(), 1, net::kMaxPlayers) : 2;   // solo: show 2 players
+    const auto sc = config::CurrentScaling();
+    const float extra = static_cast<float>(n - 1);
+    d.players = n;
+    d.normal = 1.0f + sc.hp.normal * extra;
+    d.elite = 1.0f + sc.hp.elite * extra;
+    d.boss = 1.0f + sc.hp.boss * extra;
+    d.damage = 1.0f + sc.damage * extra;
+    return d;
+}
 
 void DebugEnemyList(const std::string& filter) {
     auto& s = S();

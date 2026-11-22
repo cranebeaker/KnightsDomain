@@ -219,6 +219,13 @@ void Run(const std::string& line) {
         QD_INFO(kTag, "join {}", qd::coop::DevJoinUdp(ip, static_cast<uint16_t>(port)) ? "sent" : "not possible");
     }
     else if (cmd == "party") { std::string rest; std::getline(in, rest); qd::sync::PartyDebug(rest); }
+    else if (cmd == "difficulty") {   // difficulty normal|hard|custom [hp % dmg % per extra player]: as the host's menu
+        std::string d; float hp = 100, dmg = 25; in >> d >> hp >> dmg;
+        const float h = hp / 100.0f;
+        qd::config::SetDifficulty(d, qd::config::HpScale{h, h, h}, dmg / 100.0f);
+        qd::sync::DifficultyChanged();
+        QD_INFO(kTag, "difficulty {}", qd::config::Get().difficulty);
+    }
     else if (cmd == "god") { int v = 1; in >> v; g_god = v != 0; QD_INFO(kTag, "god {}", g_god ? 1 : 0); }
     else if (cmd == "where") {
         if (auto* ch = qd::ue::LocalCharacter()) {

@@ -8,7 +8,7 @@
 
 namespace qd::net {
 
-constexpr uint16_t kProtocolVersion = 8;   // v8: Party (revive, party rest, trading); v7: Call (boss / arena Blueprint calls); v6: WorldFlags in use, Hazard; v5: EnemyBlob, EnemyEvent Interacted (v4: Woke/CustomAttack, EnemyState flag bit4)
+constexpr uint16_t kProtocolVersion = 9;   // v9: HpScale carries enemy damage (difficulty); v8: Party (revive, party rest, trading); v7: Call (boss / arena Blueprint calls); v6: WorldFlags in use, Hazard; v5: EnemyBlob, EnemyEvent Interacted (v4: Woke/CustomAttack, EnemyState flag bit4)
 constexpr int      kMaxPlayers = 4;
 constexpr size_t   kMaxNameBytes = 72;    // UTF-8, 24 CJK chars
 constexpr size_t   kMaxItemPathBytes = 256;   // MsgEquip::itemPath
@@ -121,7 +121,7 @@ struct MsgWorldFlags      { bool full = false; std::vector<FlagValue> flags; };
 struct MsgInteractRequest { uint32_t requestId = 0; std::string actorPath; };
 enum class InteractOutcome : uint8_t { Allowed = 1, Denied, DoneByHost };
 struct MsgInteractResult  { uint32_t requestId = 0; InteractOutcome outcome = InteractOutcome::Denied; };
-struct MsgHpScale         { float normal = 1, elite = 1, boss = 1; uint8_t playerCount = 1; };
+struct MsgHpScale         { float normal = 1, elite = 1, boss = 1; uint8_t playerCount = 1; float damage = 1; };
 struct MsgSummon          { Vec3f pos; float yaw = 0; std::string areaName; };
 // the owner's copy of an enemy spawned a projectile / area attack actor (arrow, fireball, puddle ...). Followers spawn
 // the same class at the same place with their copy of the enemy as instigator, so it shows and hurts on every

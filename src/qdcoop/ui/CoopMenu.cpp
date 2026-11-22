@@ -10,6 +10,7 @@
 #include "qdcoop/core/Ownership.h"
 #include "qdcoop/core/Updater.h"
 #include "qdcoop/sync/Coop.h"
+#include "qdcoop/sync/EnemySync.h"
 #include "qdcoop/sync/CoopInternal.h"
 #include "qdcoop/sync/PlayerSync.h"
 #include "qdcoop/sync/Profiles.h"
@@ -19,6 +20,7 @@
 
 #include "imgui.h"
 
+#include <cmath>
 #include <cstdio>
 #include <cstring>
 #include <mutex>
@@ -314,6 +316,52 @@ void DrawNotice() {
     ImGui::Separator();
 }
 
+// ---- Difficulty (host's choice; clients see what the host picked)
+
+float g_customHp = -1, g_customDamage = -1;   // custom sliders, in % per extra player (-1: not read yet)
+
+int Pct(float mult) { return static_cast<int>(std::lround((mult - 1.0f) * 100.0f)); }
+
+void DrawDifficulty() {
+    ImGui::Spacing();
+    ImGui::Separator();
+    ImGui::TextUnformatted(Tr("diff.title"));
+    const sync::DifficultyInfo d = sync::GetDifficultyInfo();
+    const auto& cfg = config::Get();
+    if (g_customHp < 0) {
+        g_customHp = cfg.hpScale.normal * 100.0f;
+        g_customDamage = cfg.damageScale * 100.0f;
+    }
+    auto pick = [](const char* preset) {
+        const std::string p = preset;
+        const config::HpScale hp{g_customHp / 100.0f, g_customHp / 100.0f, g_customHp / 100.0f};
+        const float dmg = g_customDamage / 100.0f;
+        gamethread::Post([p, hp, dmg] {
+            config::SetDifficulty(p, hp, dmg);
+            sync::DifficultyChanged();
+        });
+    };
+    ImGui::BeginDisabled(!d.isHost);
+    const std::string cur = cfg.difficulty;
+    if (ImGui::RadioButton(Tr("diff.normal"), cur == "normal") && cur != "normal") pick("normal");
+    ImGui::SameLine();
+    if (ImGui::RadioButton(Tr("diff.hard"), cur == "hard") && cur != "hard") pick("hard");
+    ImGui::SameLine();
+    if (ImGui::RadioButton(Tr("diff.custom"), cur == "custom") && cur != "custom") pick("custom");
+    if (cur == "custom") {
+        ImGui::SliderFloat(Tr("diff.hp_slider"), &g_customHp, 0.0f, 300.0f, "+%.0f %%");
+        bool done = ImGui::IsItemDeactivatedAfterEdit();   // saved once the slider is let go
+        ImGui::SliderFloat(Tr("diff.dmg_slider"), &g_customDamage, 0.0f, 200.0f, "+%.0f %%");
+        done |= ImGui::IsItemDeactivatedAfterEdit();
+        if (done) pick("custom");
+    }
+    ImGui::EndDisabled();
+    ImGui::PushTextWrapPos(0.0f);
+    if (!d.isHost) ImGui::TextDisabled("%s", Tr("diff.host_only"));
+    ImGui::TextDisabled("%s", TrF("diff.effect", d.players, Pct(d.normal), Pct(d.elite), Pct(d.boss), Pct(d.damage)).c_str());
+    ImGui::PopTextWrapPos();
+}
+
 void DrawCoopTab() {
     DrawLanguageSwitch();
     ImGui::Separator();
@@ -356,6 +404,7 @@ void DrawCoopTab() {
 
     DrawFriendLobbies(s);
     DrawMembers(s);
+    DrawDifficulty();
 }
 
 // ---- My Name

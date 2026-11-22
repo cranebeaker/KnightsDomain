@@ -6,6 +6,8 @@
 #include <Windows.h>
 #include <shellapi.h>
 
+#include <algorithm>
+#include <cmath>
 #include <cstring>
 #include <filesystem>
 #include <fstream>
@@ -38,6 +40,8 @@ nlohmann::json ToJson(const Config& c) {
     j["log_level"] = c.logLevel;
     j["language"] = c.language;
     j["hp_scale"] = {{"normal", c.hpScale.normal}, {"elite", c.hpScale.elite}, {"boss", c.hpScale.boss}};
+    j["damage_scale"] = c.damageScale;
+    j["difficulty"] = c.difficulty;
     return j;
 }
 
@@ -99,6 +103,18 @@ void FromJson(const nlohmann::json& j, Config& c, bool& missing, bool& typeError
         ReadKey(*hp, "elite", c.hpScale.elite, missing, typeError);
         ReadKey(*hp, "boss", c.hpScale.boss, missing, typeError);
     }
+    ReadKey(j, "damage_scale", c.damageScale, missing, typeError);
+    if (j.contains("difficulty")) {
+        ReadKey(j, "difficulty", c.difficulty, missing, typeError);
+    } else {
+        missing = true;
+        // a config.json from before difficulties: hand-edited hp_scale values stay in effect as "custom"
+        const HpScale d{};
+        if (c.hpScale.normal != d.normal || c.hpScale.elite != d.elite || c.hpScale.boss != d.boss) {
+            c.difficulty = "custom";
+            c.damageScale = 0.0f;
+        }
+    }
 }
 
 void Sanitize(Config& c) {
@@ -119,6 +135,15 @@ void Sanitize(Config& c) {
     c.profile = 1;
 #endif
     if (!IsKnownLanguage(c.language)) c.language = "en";
+    if (c.difficulty != "normal" && c.difficulty != "hard" && c.difficulty != "custom") {
+        QD_WARN(kTag, "unknown difficulty '{}', using 'normal'", c.difficulty);
+        c.difficulty = "normal";
+    }
+    auto clampScale = [](float& v, float hi) { v = std::isfinite(v) ? std::clamp(v, 0.0f, hi) : 0.0f; };
+    clampScale(c.hpScale.normal, 4.0f);
+    clampScale(c.hpScale.elite, 4.0f);
+    clampScale(c.hpScale.boss, 4.0f);
+    clampScale(c.damageScale, 2.0f);
 }
 
 #if QD_DEV
@@ -225,6 +250,35 @@ bool Save() {
     const std::wstring dir = paths::ModDir();
     if (dir.empty() || !g_fileUsable) return false;
     return WriteFileAtomic(ConfigPath(), ToJson(g_config).dump(2) + "\n");
+}
+
+Scaling PresetScaling(const std::string& difficulty, const HpScale& customHp, float customDamage) {
+    if (difficulty == "hard") return {HpScale{1.0f, 1.0f, 1.0f}, 0.25f};
+    if (difficulty == "custom") return {customHp, customDamage};
+    return {HpScale{}, 0.0f};
+}
+
+Scaling CurrentScaling() {
+    const Config& c = Get();
+    return PresetScaling(c.difficulty, c.hpScale, c.damageScale);
+}
+
+bool SetDifficulty(const std::string& difficulty, const HpScale& customHp, float customDamage) {
+    for (Config* c : {&g_config, &g_file}) {
+        c->difficulty = difficulty;
+        if (difficulty == "custom") {
+            c->hpScale = customHp;
+            c->damageScale = customDamage;
+        }
+        Sanitize(*c);
+    }
+    if (paths::ModDir().empty() || !g_fileUsable) return false;
+    if (!WriteFileAtomic(ConfigPath(), ToJson(g_file).dump(2) + "\n")) {
+        QD_WARN(kTag, "could not write difficulty '{}' to config.json", difficulty);
+        return false;
+    }
+    QD_INFO(kTag, "difficulty '{}' saved to config.json", difficulty);
+    return true;
 }
 
 bool SetLanguage(const std::string& lang) {

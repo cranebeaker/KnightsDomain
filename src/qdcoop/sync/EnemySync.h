@@ -65,6 +65,12 @@ void         EnemySyncAlias(const SDK::AActor* actor, uint64_t id);
 #if QD_DEV
 // ---- test tooling (dev flavour only; debug/DevCommands.cpp). `filter` = case-insensitive part of the enemy's class or
 // ---- actor name; the nearest match to the local player is used. Results go to the log with tag [edbg].
+// Difficulty (host's choice, see config::Scaling): call after the host changes it; the info is what is in effect
+// here (a client: what the host sent).
+void DifficultyChanged();
+struct DifficultyInfo { bool inSession = false, isHost = true; int players = 1; float normal = 1, elite = 1, boss = 1, damage = 1; };
+DifficultyInfo GetDifficultyInfo();
+
 void DebugEnemyList(const std::string& filter);                 // one line per matching enemy
 bool DebugEnemyGoto(const std::string& filter, float dist, float angleDeg = 0);   // teleport next to it, facing it (angle: from another side)
 void DebugEnemyHp(const std::string& filter, float fraction);   // owner only: HP = fraction x max

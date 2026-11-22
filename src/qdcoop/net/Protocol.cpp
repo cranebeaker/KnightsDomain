@@ -435,12 +435,13 @@ std::vector<uint8_t> Encode(const MsgHpScale& m) {
     w.F32(m.elite);
     w.F32(m.boss);
     w.U8(m.playerCount);
+    w.F32(m.damage);
     return w.Take();
 }
 bool Decode(const uint8_t* data, size_t size, MsgHpScale& out) {
     return DecodeInto(data, size, MsgType::HpScale, out, [](ByteReader& r, MsgHpScale& m) {
         return r.F32(m.normal) && r.F32(m.elite) && r.F32(m.boss) && r.U8(m.playerCount) && m.playerCount >= 1 &&
-               m.playerCount <= kMaxPlayers;
+               m.playerCount <= kMaxPlayers && r.F32(m.damage);
     });
 }
 
