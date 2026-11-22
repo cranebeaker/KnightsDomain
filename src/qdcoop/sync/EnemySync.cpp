@@ -4207,10 +4207,13 @@ bool DebugEnemyGoto(const std::string& filter, float dist, float angleDeg) {
     // Around the Whaleking most of a ring lands in the sea: if nothing on the asked ring fits, try a closer ring,
     // then wider ones, so the player still ends up on the nearest real ground instead of not moving at all.
     // (no wider than 1.5x: an 80 m ring once put the host outside the King of Stone's fight)
+    // Every ring is tried on the enemy's own floor before any ring accepts other ground: a player put 3.5 m below a
+    // Mecha Knight's ledge drew it off the edge, and it fell out of the fight on the machine running it.
     const float rings[] = {1.0f, 0.6f, 1.5f};
-    for (float k : rings) {
-        const float rd = std::max(150.0f, dist * k);
-        for (int pass = haveFloor ? 0 : 1; pass < 2 && !found; ++pass) {
+    for (int pass = haveFloor ? 0 : 1; pass < 2 && !found; ++pass) {
+        for (float k : rings) {
+            if (found) break;
+            const float rd = std::max(150.0f, dist * k);
             for (int i = 0; i < 24 && !found; ++i) {
                 const float a = base + static_cast<float>(i) * 3.14159265f / 12.0f;
                 const float x = p.X + std::cos(a) * rd, y = p.Y + std::sin(a) * rd;
@@ -4225,7 +4228,6 @@ bool DebugEnemyGoto(const std::string& filter, float dist, float angleDeg) {
                 found = true;
             }
         }
-        if (found) break;
     }
     if (found && usedDist != dist)
         QD_INFO("edbg", "goto {}: nothing at {:.0f} cm, used a {:.0f} cm ring", ue::ClassName(e->enemy), dist, usedDist);
