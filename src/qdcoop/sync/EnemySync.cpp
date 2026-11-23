@@ -4122,6 +4122,8 @@ void DebugDescribe(Entry& e) {
 
 }  // namespace
 
+#endif   // QD_DEV
+
 void DifficultyChanged() {
     auto& s = S();
     if (!s.active || !s.isHost) return;
@@ -4153,6 +4155,7 @@ DifficultyInfo GetDifficultyInfo() {
     return d;
 }
 
+#if QD_DEV
 void DebugEnemyList(const std::string& filter) {
     auto& s = S();
     const std::string f = Lower(filter);
